@@ -1,16 +1,17 @@
-# PencilCam (working title) v0.1
+# PencilCam (working title) v0.2
 
 Live camera, redrawn as pencil, ink pen, or colored pencil, with a hand-drawn wobble.
 Same look as the browser lab, now as a real Android app.
 
-## What's in v0.1
-- Live preview with Pencil, Ink pen, and Colored pencil styles
-- "Adjust" panel: every slider from the lab, plus ink colors
-- Flip between front and back cameras
-- Take photo: saves full size to Pictures/PencilCam
-- Settings are remembered between launches
+## What's in v0.2
+- Glossy dial shutter: drag the silver ring to PHOTO / VIDEO / FILE, tap the center to shoot
+- Video recording with sound (Movies/PencilCam)
+- File mode: pick a gallery photo, apply the look, tap to save (hold to pick another)
+- Side tabs: Style, Lines, Shade, Paper, Motion (Motion hidden in Photo mode)
+- Hold it portrait: drawing on top, controls below. Turn it landscape: full screen
+- Photos and videos save the way you held the phone
 
-Coming next: video recording (v0.2), converting existing videos, more styles.
+Coming next: applying the look to saved videos in File mode, more styles.
 
 ## Getting the APK (GitHub does the building)
 
