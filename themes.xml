@@ -1,8 +1,0 @@
-<resources>
-    <!-- Dark Material theme with no title bar, so the camera fills the screen -->
-    <style name="Theme.PencilCam" parent="Theme.Material3.Dark.NoActionBar">
-        <item name="colorPrimary">#F2C230</item>
-        <item name="colorOnPrimary">#2A2208</item>
-        <item name="android:windowBackground">#1E2024</item>
-    </style>
-</resources>
