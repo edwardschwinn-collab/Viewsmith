@@ -1,6 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!-- v0.2 builds the screen in code (MainActivity) so it can re-arrange itself
-     when you turn the phone. This file is kept only as a placeholder. -->
-<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    android:layout_width="match_parent"
-    android:layout_height="match_parent" />
