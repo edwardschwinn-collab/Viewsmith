@@ -84,6 +84,7 @@ Test phone: Samsung Galaxy S24 Ultra.
 - gh CLI is installed and logged in (account edwardschwinn-collab). To test a change
   without touching main: push a branch, then `gh workflow run build.yml --ref <branch>`
   and `gh run watch <id>`. Merge to main only when green. Every push to main builds.
-- APK lands under Actions > the run > Artifacts > ViewSmith-apk.
+- APK lands under Actions > the run > Artifacts > ViewSmith-apk. After a green build, download it for Rodger with
+  `gh run download <id> -n ViewSmith-apk -D apk` and rename to apk/ViewSmith-v<version>.apk (apk/ is gitignored).
 - Signing: app/pencilcam-test.keystore (password "pencilcam") so builds install as
   updates. Repo must stay PRIVATE.

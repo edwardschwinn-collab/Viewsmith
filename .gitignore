@@ -6,3 +6,6 @@ local.properties
 .idea/
 *.iml
 .DS_Store
+
+# Downloaded APKs (built by GitHub, not source)
+apk/
