@@ -11,7 +11,7 @@ Owner: Rodger. First Android app, so explain Android-specific steps plainly.
 Test phone: Samsung Galaxy S24 Ultra. Must ALSO work on Google Pixel and other phones: no Samsung-only
 APIs, check camera/encoder capabilities and fall back, shaders stay GLSL ES 1.00 (runs on any ES 3.0 GPU).
 
-## Current state: v0.6 (versionCode 6)
+## Current state: v0.7 (versionCode 7)
 - v0.1: live sketch shader on camera feed.
 - v0.2: glossy silver/black-glass UI, ModeDial shutter (drag ring: PHOTO / VIDEO / FILE),
   video recording with sound, File mode for photos, side tabs (Style, Lines, Shade, Paper,
@@ -38,10 +38,20 @@ APIs, check camera/encoder capabilities and fall back, shaders stay GLSL ES 1.00
   Thermal palettes (u_p.w). Watercolor pooling at the bled wash edge. Polaroid caption:
   MainActivity.updateCaption() draws res/font/caveat.ttf text into a 1024x192 bitmap ->
   renderer.setCaption() -> u_caption on the bottom border.
+- v0.7: viewfinder gestures in MainActivity.onViewfinderTouch (glView touch listener):
+  swipe = next/prev look in USER coords (handleSwipe maps by deviceRot), hold 350 ms =
+  renderer.compare (PLAIN_FS, screen only), tap = focusAt() via DisplayOrientedMeteringPoint
+  Factory on the fitted picture rect + FocusRing, pinch = ScaleGestureDetector -> camera zoom.
+  Menu open = tap closes it, nothing else. Mix per look (settings.mix[] -> u_mix, applied
+  before finishes). Faves tab (Favorites.kt, prefs "viewsmith_favorites", SketchSettings
+  toJson/fromJson, keeps mirror + rotationFix). Self-timer button (GlossButton.TIMER, prefs
+  "timerSec") with countdownText. Seven tabs at 54dp.
+- Polaroid "squeeze in landscape" (reported v0.6): shader math verified round in WebGL
+  (circle stays round, just cropped). Waiting on a screenshot from Rodger to see what he saw.
 - Looks can be previewed without a phone: extract the shaders into a WebGL page and
   screenshot it with headless Edge (--use-angle=swiftshader --enable-unsafe-swiftshader).
   Also compiles every shader under strict GLSL ES 1.00 first.
-- v0.4 to v0.6 have NOT been tested on a phone yet. Most likely trouble spots: video rotation
+- v0.4 to v0.7 have NOT been tested on a phone yet. Most likely trouble spots: video rotation
   sign in File mode (renderer applies the clip's rotation itself in Pass 0, decoder
   KEY_ROTATION forced to 0), the look of styles 3-12 (tuned by reasoning, never seen),
   shader compile errors (only show at runtime in logcat), polaroid/glossy orientation

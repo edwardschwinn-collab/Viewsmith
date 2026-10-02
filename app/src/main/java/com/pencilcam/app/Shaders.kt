@@ -99,6 +99,18 @@ void main(){ gl_FragColor = texture2D(u_cam, v_tex); }
 """
 
     /** Pass 0 for a gallery photo. Bitmaps load upside down for OpenGL, so flip Y. */
+    /**
+     * Hold to compare: show the plain upright picture (the output of Pass
+     * 0) on screen with no look at all. Only used for the screen; anything
+     * being recorded or saved keeps the look.
+     */
+    const val PLAIN_FS = """
+precision mediump float;
+uniform sampler2D u_img;
+varying vec2 v_uv;
+void main(){ gl_FragColor = vec4(texture2D(u_img, v_uv).rgb, 1.0); }
+"""
+
     const val COPY2D_FS = """
 precision mediump float;
 uniform sampler2D u_img;
@@ -282,6 +294,7 @@ uniform vec3 u_ink;
 uniform vec4 u_p;
 uniform vec4 u_finOn, u_finA, u_finB;
 uniform float u_frameRot, u_time, u_dmg, u_capOn;
+uniform float u_mix;          // Mix slider: 1 = all look, 0 = the plain picture
 varying vec2 v_uv;
 
 // ---- Helpers ---------------------------------------------------------------
@@ -805,6 +818,10 @@ void main(){
     col = thermal(clamp(heat, 0.0, 1.0), u_p.w);
     col *= 1.0 - u_p.z*0.3*(0.5 + 0.5*sin(px.y*2.2));
   }
+
+  // ---- Mix: blend the look back toward the plain picture. The finishes
+  // still go on top at full strength, so a polaroid stays a polaroid.
+  col = mix(src, col, u_mix);
 
   // ---- Finishes, always in this order so they stack the same way every time:
   // matte, glossy punch, polaroid tones, vignette, polaroid border, glossy shine.

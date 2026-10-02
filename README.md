@@ -1,6 +1,6 @@
 <img src="design/viewsmith-icon-512.png" width="128" align="right" alt="ViewSmith icon">
 
-# ViewSmith v0.6
+# ViewSmith v0.7
 
 ViewSmith is a camera app that redraws what it sees by hand. Point it at something and the
 screen shows it as a pencil sketch, a watercolor, an oil painting, a neon sign, an old west
@@ -33,13 +33,32 @@ Hold the phone upright and the drawing sits on top with the controls underneath.
 sideways and the drawing fills the screen. The app doesn't actually rotate; the icons and
 menus turn themselves to face you, so the camera never restarts in the middle of a shot.
 
+### Touching the picture
+
+| Do this | What happens |
+|---------|--------------|
+| Swipe left or right | Next or previous look, with the look label fading in. Left and right are yours, however you're holding the phone |
+| Press and hold | Shows the plain camera (or the plain photo or video in File mode) until you let go. Only the screen changes; a recording keeps the look |
+| Tap | Focuses and sets the exposure on that spot. A small silver ring shows where, then fades |
+| Pinch | Zooms in and out. The zoom shows briefly as "2.0x" |
+
+With a menu open, tapping the picture just closes the menu, so the look can't change by accident.
+
+**Self-timer:** in Photo mode, the stopwatch button on the left of the dial steps through
+Off, 3 seconds, and 10 seconds. Tap the dial and a big countdown runs over the picture before
+the photo is taken. Tap the dial again during the countdown to call it off.
+
 ### The side tabs
 
-- **Style**: pick one look. Under the list are that look's own sliders, plus Mirror image,
-  Rotate camera 90° (in case a camera ever shows up sideways), and Reset all sliders.
+- **Style**: pick one look. Under the list are that look's own sliders, starting with **Mix**
+  (blend the look with the plain picture, 0 to 100%, each look remembers its own), plus
+  Mirror image, Rotate camera 90° (in case a camera ever shows up sideways), and Reset all sliders.
 - **Finish**: vignette, matte, glossy, and polaroid. Each has an On switch and two sliders,
   and you can stack any number of them. When any are on, the Finish tab glows silver and
   shows how many.
+- **Faves**: save the current look (style, finishes, and every slider) under a name, then
+  load, rename, or delete it later. Kept between launches. Mirror image and the camera
+  rotation fix stay as they are when a favorite loads, since they belong to the phone.
 - **Lines**: ink color, and how dark, how detailed, and how soft the outlines are. With Neon
   edges picked, the ink colors become neon tube colors: hot pink, electric blue, lime, purple,
   orange, and white.
@@ -111,7 +130,15 @@ The gear in the bottom-left corner (it moves to stay in *your* bottom-left as yo
 
 The back gesture closes an open menu first.
 
-## What's new in v0.6
+## What's new in v0.7
+
+- Swipe left or right on the picture to change looks
+- Press and hold to see the plain camera, let go to get the look back
+- A Mix slider on every look, to blend it with the plain picture
+- A Faves tab: save looks under a name, then load, rename, or delete them
+- Pinch to zoom, tap to focus and set exposure, and a photo self-timer (3 or 10 seconds)
+
+## What came in v0.6
 
 - **Neon edges**: neon tube colors on the Lines tab, and four modes: Solid, Rainbow (slowly
   cycling), Two-tone (white-hot core), and Scene color
@@ -189,6 +216,7 @@ along with the release key.
 | `VideoFile.kt` | File mode videos: playing them on screen and saving drawn copies |
 | `VideoRecorder.kt` | Recording in Video mode, and checking what the phone's video encoder can do |
 | `ModeDial.kt` | The silver dial shutter |
-| `Gloss.kt` | The black glass and silver look for every control |
+| `Gloss.kt` | The black glass and silver look for every control, plus the focus ring and timer button |
+| `Favorites.kt` | Saved looks, kept between launches |
 | `design/` | The icon artwork, and the license for the Caveat handwriting font |
 | `res/font/caveat.ttf` | The handwriting font for polaroid captions (SIL Open Font License) |

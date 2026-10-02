@@ -22,6 +22,10 @@ import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Size
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
+import android.view.ViewConfiguration
 import android.view.OrientationEventListener
 import android.view.Surface
 import android.view.View
@@ -46,6 +50,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.AspectRatio
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.DisplayOrientedMeteringPointFactory
+import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
@@ -59,6 +65,9 @@ import androidx.core.view.WindowInsetsControllerCompat
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.TimeUnit
+import kotlin.math.abs
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -131,6 +140,13 @@ class MainActivity : AppCompatActivity() {
     // The settings file keeps its old name so nobody's saved look is lost (see SketchSettings)
     private val prefs by lazy { getSharedPreferences("pencilcam", MODE_PRIVATE) }
     private var useFront = false
+    private var camera: androidx.camera.core.Camera? = null    // the bound camera, for zoom and focus
+    private val favorites by lazy { Favorites(this) }
+    private var timerSec = 0                                 // photo self-timer: 0 (off), 3, or 10
+    private var countdownLeft = 0                            // seconds left on a running countdown, 0 = none
+    private lateinit var timerBtn: GlossButton
+    private lateinit var countdownText: TextView             // the big 3, 2, 1 over the picture
+    private lateinit var focusRing: FocusRing
     private var deviceRot = 0              // 0, 90, 180, 270: how the phone is being held
     private var pendingRot = 0
     private var landscapeHeld = false
@@ -255,6 +271,7 @@ class MainActivity : AppCompatActivity() {
         orientationListener.disable()
         if (recording) stopRecording(fromPause = true)
         exporter?.cancel()                                   // leaving the app stops a video save
+        cancelCountdown(); endCompare()
         stopPlayer()
         glView.onPause(); super.onPause()
     }
@@ -282,13 +299,15 @@ class MainActivity : AppCompatActivity() {
         renderer.onRecordError = { msg -> toast(msg); stopRecording(failed = true) }
         glView.setRenderer(renderer)
         glView.renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY     // only redraw when something changes
+        glView.setOnTouchListener { _, e -> onViewfinderTouch(e) }   // swipe, hold, tap, pinch (see below)
         videoBox.addView(glView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
         tabsCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        for (name in listOf("Style", "Finish", "Lines", "Shade", "Paper", "Motion")) {
+        for (name in listOf("Style", "Finish", "Faves", "Lines", "Shade", "Paper", "Motion")) {
             val t = GlossTab(this, name).apply { setOnClickListener { toggleTab(name) }; contentDescription = "$name settings" }
             tabs[name] = t
-            tabsCol.addView(t, LinearLayout.LayoutParams(dp(58), dp(58)).apply { topMargin = dp(5); bottomMargin = dp(5) })
+            // Seven tabs have to fit down the side of the drawing on a small phone, so 54dp each
+            tabsCol.addView(t, LinearLayout.LayoutParams(dp(54), dp(54)).apply { topMargin = dp(4); bottomMargin = dp(4) })
         }
         videoBox.addView(tabsCol, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.END or Gravity.CENTER_VERTICAL).apply { marginEnd = dp(8) })
@@ -322,6 +341,21 @@ class MainActivity : AppCompatActivity() {
         videoBox.addView(lookLabel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
 
+        // Self-timer countdown: a big silver number in the middle of the
+        // picture, with a dark halo so it reads over anything, turned to face you
+        countdownText = TextView(this).apply {
+            setTextColor(Gloss.SILVER_HI); textSize = 110f; gravity = Gravity.CENTER
+            paint.isFakeBoldText = true
+            setShadowLayer(18f, 0f, 6f, Color.argb(220, 0, 0, 0))
+            visibility = View.GONE
+        }
+        videoBox.addView(countdownText, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
+
+        // Focus ring, moved to wherever you tap
+        focusRing = FocusRing(this).apply { alpha = 0f; visibility = View.GONE }
+        videoBox.addView(focusRing, FrameLayout.LayoutParams(dp(76), dp(76), Gravity.TOP or Gravity.LEFT))
+
         // --- Control deck (dial, flip button, mode label)
         deck = FrameLayout(this)
         root.addView(deck, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(230), Gravity.BOTTOM))
@@ -340,6 +374,21 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { flipCamera() }
         }
         deck.addView(flipBtn, FrameLayout.LayoutParams(dp(60), dp(60), Gravity.CENTER))
+
+        // Self-timer button, on the other side of the dial from the flip
+        // button. Each tap steps Off, 3 s, 10 s. Only shown in Photo mode.
+        timerBtn = GlossButton(this, GlossButton.TIMER).apply {
+            contentDescription = "Self-timer"
+            translationX = -dp(122).toFloat()
+            timerSeconds = timerSec
+            setOnClickListener {
+                timerSec = when (timerSec) { 0 -> 3; 3 -> 10; else -> 0 }
+                timerSeconds = timerSec
+                prefs.edit().putInt("timerSec", timerSec).apply()
+                showLabel(if (timerSec == 0) "Timer off" else "Timer ${timerSec}s")
+            }
+        }
+        deck.addView(timerBtn, FrameLayout.LayoutParams(dp(60), dp(60), Gravity.CENTER))
 
         modeLabel = TextView(this).apply {
             setTextColor(Gloss.TEXT); textSize = 14f; gravity = Gravity.CENTER
@@ -473,8 +522,11 @@ class MainActivity : AppCompatActivity() {
      * Show the look label ("Oil painting + Matte") for 2 seconds: fade in,
      * hold, fade out. Called whenever the look or the finishes change.
      */
-    private fun showLookLabel() {
-        lookLabel.text = settings.summary()
+    private fun showLookLabel() = showLabel(settings.summary())
+
+    /** Fade any short message into the look label spot for 2 seconds (look changes, zoom, timer). */
+    private fun showLabel(text: String) {
+        lookLabel.text = text
         placeLookLabel()
         lookLabel.animate().cancel()
         handler.removeCallbacks(hideLookLabel)
@@ -542,6 +594,8 @@ class MainActivity : AppCompatActivity() {
             }
         }
         spin({ flipBtn.iconRotation }, { flipBtn.iconRotation = it })
+        spin({ timerBtn.iconRotation }, { timerBtn.iconRotation = it })
+        countdownText.rotation = target
         tabs.values.forEach { t -> spin({ t.iconRotation }, { t.iconRotation = it }) }
         dial.iconRotation = target
     }
@@ -561,6 +615,8 @@ class MainActivity : AppCompatActivity() {
         tabs["Motion"]?.visibility = if (m == ModeDial.PHOTO) View.GONE else View.VISIBLE
         if (m == ModeDial.PHOTO && openTab == "Motion") closePanel()
         flipBtn.visibility = if (m == ModeDial.FILE) View.INVISIBLE else View.VISIBLE
+        timerBtn.visibility = if (m == ModeDial.PHOTO) View.VISIBLE else View.INVISIBLE
+        cancelCountdown()
 
         if (old == ModeDial.FILE && m != ModeDial.FILE) clearFile()
         when (m) {
@@ -575,7 +631,11 @@ class MainActivity : AppCompatActivity() {
     /** The center of the dial was tapped. What it does depends on the mode. */
     private fun shutter() {
         when (mode) {
-            ModeDial.PHOTO -> takePhoto()
+            ModeDial.PHOTO -> when {
+                countdownLeft > 0 -> cancelCountdown()           // tap again to call off the timer
+                timerSec > 0 -> startCountdown()
+                else -> takePhoto()
+            }
             ModeDial.VIDEO -> if (recording) stopRecording() else startRecording()
             ModeDial.FILE -> when {
                 exporting -> exporter?.cancel()                 // tap again to stop a save
@@ -604,6 +664,203 @@ class MainActivity : AppCompatActivity() {
     private fun outRotation(): Int = if (settings.mirror) (360 - deviceRot) % 360 else deviceRot
 
     // ========================================================================
+    // Touching the picture: swipe, hold, tap, pinch
+    //
+    // One finger:
+    //   Swipe left or right -> next or previous look. Left and right are
+    //                          YOURS, however the phone is held.
+    //   Press and hold      -> show the plain camera until you let go
+    //   Quick tap           -> focus and set the exposure right there
+    // Two fingers:
+    //   Pinch               -> zoom
+    // While a menu is open, a tap on the picture just closes the menu and
+    // nothing else happens, so the look can't change by accident. The side
+    // tabs, menus, and dial sit on top of the picture, so touches on them
+    // never reach this code at all.
+    //
+    // How the code tells them apart: every touch starts as NONE. Moving
+    // farther than a small "slop" distance makes it a SWIPE. Staying still
+    // for 350 ms makes it a HOLD. A second finger makes it a PINCH. Lifting
+    // the finger while it's still NONE means it was a quick tap.
+    // ========================================================================
+    private enum class Gesture { NONE, SWIPE, HOLD, PINCH, MENU }
+    private var gesture = Gesture.NONE
+    private var downX = 0f; private var downY = 0f; private var downTime = 0L
+    private val touchSlop by lazy { ViewConfiguration.get(this).scaledTouchSlop }
+
+    private val holdToCompare = Runnable {
+        if (gesture == Gesture.NONE) {
+            gesture = Gesture.HOLD
+            renderer.compare = true; glView.requestRender()
+            if (haptics) glView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        }
+    }
+
+    /** Back to the look after a hold (also called if the app is paused mid-hold). */
+    private fun endCompare() {
+        handler.removeCallbacks(holdToCompare)
+        if (renderer.compare) { renderer.compare = false; glView.requestRender() }
+    }
+
+    /**
+     * Pinch zoom. Android works out how far the fingers spread or closed
+     * since last time (scaleFactor, like 1.03 = 3% wider). Multiply the
+     * camera's zoom by that, kept between the camera's own minimum and
+     * maximum, which differ from phone to phone and lens to lens.
+     */
+    private val scaleDetector by lazy {
+        ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(d: ScaleGestureDetector): Boolean {
+                if (mode == ModeDial.FILE) return true
+                val cam = camera ?: return true
+                val zs = cam.cameraInfo.zoomState.value ?: return true
+                val z = (zs.zoomRatio * d.scaleFactor).coerceIn(zs.minZoomRatio, zs.maxZoomRatio)
+                cam.cameraControl.setZoomRatio(z)
+                showLabel("%.1fx".format(z))
+                return true
+            }
+        })
+    }
+
+    private fun onViewfinderTouch(e: MotionEvent): Boolean {
+        scaleDetector.onTouchEvent(e)
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downX = e.x; downY = e.y; downTime = SystemClock.uptimeMillis()
+                gesture = if (openTab != null || settingsOpen) Gesture.MENU else Gesture.NONE
+                if (gesture == Gesture.NONE) handler.postDelayed(holdToCompare, 350)
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                // A second finger means pinch. Drop the hold or swipe in progress.
+                if (gesture != Gesture.MENU) gesture = Gesture.PINCH
+                endCompare()
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (gesture == Gesture.NONE && hypot(e.x - downX, e.y - downY) > touchSlop) {
+                    gesture = Gesture.SWIPE
+                    handler.removeCallbacks(holdToCompare)
+                }
+            }
+            MotionEvent.ACTION_UP -> {
+                handler.removeCallbacks(holdToCompare)
+                when (gesture) {
+                    Gesture.HOLD -> endCompare()
+                    Gesture.MENU -> if (hypot(e.x - downX, e.y - downY) < touchSlop) {
+                        if (settingsOpen) closeSettings()
+                        if (openTab != null) closePanel()
+                    }
+                    Gesture.SWIPE -> handleSwipe(e.x - downX, e.y - downY, SystemClock.uptimeMillis() - downTime)
+                    Gesture.NONE -> focusAt(e.x, e.y)
+                    Gesture.PINCH -> {}
+                }
+                gesture = Gesture.NONE
+            }
+            MotionEvent.ACTION_CANCEL -> { endCompare(); gesture = Gesture.NONE }
+        }
+        return true
+    }
+
+    /**
+     * A swipe ended. Turn the finger's movement (in the portrait grid) into
+     * YOUR left/right and up/down, then if it was mostly sideways, long
+     * enough, and quick enough, step to the next look (swipe left, like
+     * turning a page) or the previous one (swipe right). Wraps around.
+     */
+    private fun handleSwipe(dx: Float, dy: Float, ms: Long) {
+        val (ux, uy) = when (deviceRot) {
+            90 -> -dy to dx           // left side up: your right is the portrait top
+            180 -> -dx to -dy
+            270 -> dy to -dx          // right side up: your right is the portrait bottom
+            else -> dx to dy
+        }
+        if (abs(ux) < dp(60) || abs(ux) < abs(uy) * 1.5f || ms > 800) return
+        val step = if (ux < 0) 1 else -1
+        settings.style = (settings.style + step + Looks.count) % Looks.count
+        pushSettings()
+        showLookLabel()
+        if (haptics) glView.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+    }
+
+    /**
+     * Tap to focus. The drawing is fitted inside the view with black bars,
+     * so first work out where the picture actually sits and ignore taps on
+     * the bars. CameraX's DisplayOrientedMeteringPointFactory then turns a
+     * spot on that upright picture into a spot on the camera sensor (it
+     * handles the sensor being mounted sideways, and the selfie camera
+     * being mirrored). Focus (AF) and exposure (AE) both aim at that spot,
+     * and the camera goes back to normal after 4 seconds.
+     */
+    private fun focusAt(x: Float, y: Float) {
+        if (mode == ModeDial.FILE) return
+        val cam = camera ?: return
+        val size = renderer.procSize
+        if (size.width == 0) return
+        val vw = glView.width.toFloat(); val vh = glView.height.toFloat()
+        val scale = min(vw / size.width, vh / size.height)
+        val rw = size.width * scale; val rh = size.height * scale
+        val left = (vw - rw) / 2f; val top = (vh - rh) / 2f
+        if (x < left || x > left + rw || y < top || y > top + rh) return
+        val disp = glView.display ?: return
+        try {
+            val point = DisplayOrientedMeteringPointFactory(disp, cam.cameraInfo, rw, rh).createPoint(x - left, y - top)
+            val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+                .setAutoCancelDuration(4, TimeUnit.SECONDS).build()
+            cam.cameraControl.startFocusAndMetering(action)
+        } catch (e: Exception) { /* some cameras (fixed-focus selfie cams) can't; the ring still shows */ }
+        showFocusRing(x, y)
+    }
+
+    /** Pop the silver ring in at the tap, shrink it into place, then fade it out. */
+    private fun showFocusRing(x: Float, y: Float) {
+        val s = dp(76)
+        focusRing.animate().cancel()
+        focusRing.translationX = x - s / 2f; focusRing.translationY = y - s / 2f
+        focusRing.visibility = View.VISIBLE; focusRing.alpha = 1f
+        focusRing.scaleX = 1.35f; focusRing.scaleY = 1.35f
+        focusRing.animate().setStartDelay(0).scaleX(1f).scaleY(1f).setDuration(180).withEndAction {
+            focusRing.animate().setStartDelay(800).alpha(0f).setDuration(400)
+                .withEndAction { focusRing.visibility = View.GONE }.start()
+        }.start()
+    }
+
+    // ========================================================================
+    // Photo self-timer
+    // ========================================================================
+    /** Start counting down: 3, 2, 1 (or 10 down to 1), then take the photo. */
+    private fun startCountdown() {
+        countdownLeft = timerSec
+        showCount()
+        handler.postDelayed(countdownTick, 1000)
+    }
+
+    private val countdownTick = object : Runnable {
+        override fun run() {
+            if (countdownLeft <= 0) return
+            countdownLeft--
+            if (countdownLeft == 0) { countdownText.visibility = View.GONE; takePhoto(); return }
+            showCount()
+            handler.postDelayed(this, 1000)
+        }
+    }
+
+    /** Show the current number big in the middle, popping in and turned to face you. */
+    private fun showCount() {
+        countdownText.text = "$countdownLeft"
+        countdownText.rotation = -deviceRot.toFloat()
+        countdownText.visibility = View.VISIBLE
+        countdownText.alpha = 0.3f; countdownText.scaleX = 1.4f; countdownText.scaleY = 1.4f
+        countdownText.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(250).start()
+        if (haptics) glView.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+    }
+
+    /** Call off a running countdown (tap the dial again, change mode, or leave the app). */
+    private fun cancelCountdown() {
+        handler.removeCallbacks(countdownTick)
+        countdownLeft = 0
+        countdownText.visibility = View.GONE
+    }
+
+    // ========================================================================
     // Camera (CameraX)
     // ========================================================================
     private fun startCamera() {
@@ -612,7 +869,7 @@ class MainActivity : AppCompatActivity() {
         future.addListener({
             val provider = future.get()
             // With a photo or video loaded in File mode the camera isn't needed, so turn it off to save battery
-            if (mode == ModeDial.FILE && fileLoaded()) { provider.unbindAll(); return@addListener }
+            if (mode == ModeDial.FILE && fileLoaded()) { provider.unbindAll(); camera = null; return@addListener }
 
             // Upright = 4:3, sideways = 16:9. Photo mode asks for 1920 on the long
             // side. Video mode asks for the recording size from Settings.
@@ -640,7 +897,7 @@ class MainActivity : AppCompatActivity() {
                 if (!has(other)) { toast("No camera found on this device."); return@addListener }
                 useFront = !useFront; settings.mirror = useFront; pushSettings(); lens = other
             }
-            try { provider.unbindAll(); provider.bindToLifecycle(this, lens, preview) }
+            try { provider.unbindAll(); camera = provider.bindToLifecycle(this, lens, preview) }
             catch (e: Exception) { toast("Camera couldn't start: ${e.message}") }
         }, ContextCompat.getMainExecutor(this))
     }
@@ -1046,6 +1303,7 @@ class MainActivity : AppCompatActivity() {
         haptics = prefs.getBoolean("haptics", true)
         keepAwake = prefs.getBoolean("keepAwake", true)
         rememberLook = prefs.getBoolean("rememberLook", true)
+        timerSec = prefs.getInt("timerSec", 0).let { if (it == 3 || it == 10) it else 0 }
         videoShort = prefs.getInt("videoShort", 1080).let { v -> if (videoSizes.any { it.second == v }) v else 1080 }
     }
 
@@ -1111,6 +1369,7 @@ class MainActivity : AppCompatActivity() {
                     updateFinishBadge(); updateCaption(); showLookLabel()
                 }
             }
+            "Faves" -> buildFavorites()
             "Finish" -> {
                 heading("Finishes")
                 note("Switch on as many as you like. They sit on top of any look.")
@@ -1203,6 +1462,100 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * The Faves tab. At the top, a box to name the current look and a Save
+     * button. Below, every saved look as a row: its name (tap it to load),
+     * then Load, Rename, and Delete. Rename turns the name into a text box
+     * and the button into Done. Delete asks "Sure?" first and gives you 3
+     * seconds to tap again. Mirror image and the camera rotation fix never
+     * change when a favorite loads, since they belong to the phone, not the look.
+     */
+    private fun buildFavorites() {
+        heading("Favorites")
+        note("Saves the look, its finishes, and every slider.")
+        val nameBox = glassEditText("Name this look (optional)")
+        target.addView(nameBox, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        button("Save current look") {
+            favorites.add(nameBox.text.toString(), settings)
+            hideKeyboard(nameBox)
+            showLabel("Saved \"${favorites.list.last().name}\"")
+            buildGroup("Faves")
+        }
+        if (favorites.list.isEmpty()) { note("Nothing saved yet."); return }
+
+        heading("Saved looks")
+        favorites.list.toList().forEach { fav ->
+            // Name: a big tappable line, swapped for a text box while renaming
+            val name = TextView(this).apply {
+                text = fav.name; setTextColor(Gloss.SILVER_HI); textSize = 15f; shade()
+                setPadding(0, dp(10), 0, dp(2))
+                setOnClickListener { loadFavorite(fav) }
+            }
+            val edit = glassEditText("New name").apply { setText(fav.name); visibility = View.GONE }
+            target.addView(name)
+            target.addView(edit, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            val row = LinearLayout(this)
+            smallButton(row, "Load") { loadFavorite(fav) }
+            smallButton(row, "Rename") { btn ->
+                if (edit.visibility != View.VISIBLE) {
+                    edit.visibility = View.VISIBLE; name.visibility = View.GONE; btn.text = "Done"
+                    edit.requestFocus()
+                } else {
+                    favorites.rename(fav, edit.text.toString())
+                    hideKeyboard(edit)
+                    buildGroup("Faves")
+                }
+            }
+            smallButton(row, "Delete", danger = true) { btn ->
+                if (btn.text.toString() == "Sure?") { favorites.delete(fav); buildGroup("Faves") }
+                else {
+                    btn.text = "Sure?"
+                    handler.postDelayed({ if (btn.isAttachedToWindow) btn.text = "Delete" }, 3000)
+                }
+            }
+            target.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+    }
+
+    /** Put a favorite's look on screen. */
+    private fun loadFavorite(fav: Favorites.Fav) {
+        settings = SketchSettings.fromJson(fav.look, settings)
+        pushSettings(); updateFinishBadge(); updateCaption()
+        showLabel("${fav.name}: ${settings.summary()}")
+    }
+
+    /** A text box in the glass style: light text, dark halo, silver underline. */
+    private fun glassEditText(hintText: String) = EditText(this).apply {
+        hint = hintText
+        setTextColor(Gloss.SILVER_HI); setHintTextColor(Gloss.TEXT_DIM); textSize = 14f; shade()
+        backgroundTintList = ColorStateList.valueOf(Gloss.SILVER_1)
+        isSingleLine = true
+        imeOptions = EditorInfo.IME_ACTION_DONE
+        filters = arrayOf(InputFilter.LengthFilter(40))
+    }
+
+    private fun hideKeyboard(v: View) {
+        (getSystemService(INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager)
+            ?.hideSoftInputFromWindow(v.windowToken, 0)
+        v.clearFocus()
+    }
+
+    /** A small silver button that shares a row with others (Load, Rename, Delete). */
+    private fun smallButton(row: LinearLayout, label: String, danger: Boolean = false, action: (TextView) -> Unit) {
+        val b = TextView(this).apply {
+            text = label; textSize = 13f; gravity = Gravity.CENTER
+            setTextColor(if (danger) Color.parseColor("#A3170F") else Color.parseColor("#15171A"))
+            if (danger) paint.isFakeBoldText = true
+            setPadding(dp(6), dp(8), dp(6), dp(8))
+            background = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                intArrayOf(Gloss.SILVER_HI, Gloss.SILVER_1, Gloss.SILVER_2)).apply { cornerRadius = dp(9).toFloat() }
+        }
+        b.setOnClickListener { action(b) }
+        row.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+            marginEnd = dp(6); topMargin = dp(4)
+        })
+    }
+
+    /**
      * Polaroid caption: Off, Today's date, or Custom, plus a text box for
      * the custom words. The text box only shows when Custom is picked.
      */
@@ -1279,7 +1632,11 @@ class MainActivity : AppCompatActivity() {
         val boxRefreshers = mutableListOf<() -> Unit>()
         target = box; targetRefreshers = boxRefreshers
         val params = Looks.params[settings.style]
-        if (params.isNotEmpty()) heading("${Looks.names[settings.style]} settings")
+        heading("${Looks.names[settings.style]} settings")
+        // Mix: how much of the look versus the plain picture. Every look has
+        // its own, so a 40% watercolor doesn't make pencil 40% too.
+        val st = settings.style
+        slider("Mix", 0f, 100f, 1f, { settings.mixFor(st) * 100f }, { settings.mix[st] = it / 100f }) { "${it.roundToInt()}%" }
         params.forEachIndexed { i, p ->
             val names = p.choices
             if (names != null) choiceRow(p.label, names, { settings.lookParam(i).roundToInt() }, { settings.setLookParam(i, it.toFloat()) })

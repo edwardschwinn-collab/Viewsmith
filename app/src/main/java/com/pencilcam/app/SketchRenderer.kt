@@ -76,6 +76,8 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
     @Volatile var videoPreviewShort = 1080
     /** Which picture edge is the viewer's bottom (0, 90, 180, 270), for the polaroid border and glossy shine. */
     @Volatile var frameRot = 0
+    /** True while you hold a finger on the viewfinder: show the plain picture instead of the look. */
+    @Volatile var compare = false
 
     // ---- Camera input
     // CameraX asks for a Surface to send frames into. I make one from a
@@ -169,7 +171,7 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
 
     // ---- Shader programs, the full screen rectangle, and the off-screen images
     private var pCopy = 0; private var pCopy2D = 0; private var pBlurH = 0; private var pBlurV = 0; private var pDraw = 0
-    private var pOilGrad = 0; private var pOilPaint = 0
+    private var pOilGrad = 0; private var pOilPaint = 0; private var pPlain = 0
     private lateinit var quad: FloatBuffer
     /** An off-screen image the GPU can draw into (framebuffer + texture). */
     private class Target(val fb: Int, val tex: Int, val w: Int, val h: Int)
@@ -236,6 +238,7 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
         pDraw = program(Shaders.DRAW_VS, Shaders.DRAW_FS)
         pOilGrad = program(Shaders.QUAD_VS, Shaders.OIL_GRAD_FS)
         pOilPaint = program(Shaders.QUAD_VS, Shaders.OIL_PAINT_FS)
+        pPlain = program(Shaders.QUAD_VS, Shaders.PLAIN_FS)
         oilGradT = null; oilPaintT = null
         // The caption texture went with the old context too; upload it again
         capTex = 0
@@ -389,7 +392,12 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
         val scale = min(viewW.toFloat() / w, viewH.toFloat() / h)
         val vw = (w * scale).toInt(); val vh = (h * scale).toInt()
         GLES20.glViewport((viewW - vw) / 2, (viewH - vh) / 2, vw, vh)
-        drawSketch(s, src, b, w, h, k)
+        if (compare) {
+            // Hold to compare: the plain picture, no look (screen only)
+            GLES20.glUseProgram(pPlain)
+            bindTex(0, src.tex); GLES20.glUniform1i(loc(pPlain, "u_img"), 0)
+            drawQuad()
+        } else drawSketch(s, src, b, w, h, k)
 
         // ---- Camera recording (Video mode)
         handleRecording(s, src, b, w, h, k, now)
@@ -662,6 +670,7 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
         GLES20.glUniform4f(loc(pDraw, "u_p"), s.lookParam(0), s.lookParam(1), s.lookParam(2), s.lookParam(3))
         GLES20.glUniform1f(loc(pDraw, "u_time"), timeSec)
         GLES20.glUniform1f(loc(pDraw, "u_dmg"), s.damageSeed)
+        GLES20.glUniform1f(loc(pDraw, "u_mix"), s.mixFor(s.style))
         // Oil paint (unit 2) and caption (unit 3). When they aren't in use,
         // point those slots at the source picture so they're never empty.
         val paint = if (s.style == Looks.OIL) oilPaintT?.tex ?: src.tex else src.tex

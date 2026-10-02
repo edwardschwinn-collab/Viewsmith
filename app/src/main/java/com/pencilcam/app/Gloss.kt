@@ -189,9 +189,12 @@ class GlossTab(context: Context, var label: String) : View(context) {
  * iconRotation turns only the icon; the silver bezel and its shine stay lit from above.
  */
 class GlossButton(context: Context, private val icon: Int = FLIP) : View(context) {
-    companion object { const val FLIP = 0; const val COG = 1 }
+    companion object { const val FLIP = 0; const val COG = 1; const val TIMER = 2 }
 
     var iconRotation = 0f
+        set(v) { field = v; invalidate() }
+    /** TIMER icon only: 0 = timer off, otherwise the seconds it counts down (3 or 10). */
+    var timerSeconds = 0
         set(v) { field = v; invalidate() }
 
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -211,7 +214,11 @@ class GlossButton(context: Context, private val icon: Int = FLIP) : View(context
         c.drawOval(RectF(cx - r2 * 0.7f, cy - r2 * 0.92f, cx + r2 * 0.7f, cy - r2 * 0.1f), p)       // top shine
 
         c.save(); c.rotate(iconRotation, cx, cy)                                                      // only the icon turns
-        if (icon == COG) drawCog(c, cx, cy, r2, R) else drawFlip(c, cx, cy, r2, R)
+        when (icon) {
+            COG -> drawCog(c, cx, cy, r2, R)
+            TIMER -> drawTimer(c, cx, cy, r2, R)
+            else -> drawFlip(c, cx, cy, r2, R)
+        }
         c.restore()
     }
 
@@ -228,6 +235,30 @@ class GlossButton(context: Context, private val icon: Int = FLIP) : View(context
         c.drawPath(a, line)
     }
 
+    /**
+     * Self-timer: a stopwatch (round face, a button on top, one hand).
+     * Off: the stopwatch is dim with a slash through it. On: the number of
+     * seconds sits inside the face.
+     */
+    private fun drawTimer(c: Canvas, cx: Float, cy: Float, r2: Float, R: Float) {
+        val s = r2 * 0.52f
+        val on = timerSeconds > 0
+        line.color = if (on) Gloss.TEXT else Gloss.TEXT_DIM; line.strokeWidth = R * 0.07f
+        c.drawCircle(cx, cy + s * 0.12f, s * 0.85f, line)                       // face
+        c.drawLine(cx, cy - s * 0.73f, cx, cy - s * 0.95f, line)                 // stem
+        c.drawLine(cx - s * 0.22f, cy - s * 0.98f, cx + s * 0.22f, cy - s * 0.98f, line)   // button on top
+        if (on) {
+            solid.shader = null; solid.color = Gloss.SILVER_HI
+            solid.textAlign = Paint.Align.CENTER; solid.isFakeBoldText = true
+            solid.textSize = s * (if (timerSeconds >= 10) 0.85f else 1.05f)
+            c.drawText("$timerSeconds", cx, cy + s * 0.12f + solid.textSize * 0.36f, solid)
+        } else {
+            c.drawLine(cx, cy + s * 0.12f, cx + s * 0.4f, cy - s * 0.2f, line)   // hand
+            line.color = Gloss.TEXT; line.strokeWidth = R * 0.06f
+            c.drawLine(cx - s * 0.9f, cy + s * 0.95f, cx + s * 0.9f, cy - s * 0.75f, line)   // slash = off
+        }
+    }
+
     /** Settings gear: solid hub, 8 square teeth, black-glass hole in the middle. */
     private fun drawCog(c: Canvas, cx: Float, cy: Float, r2: Float, R: Float) {
         val s = r2 * 0.6f
@@ -242,5 +273,33 @@ class GlossButton(context: Context, private val icon: Int = FLIP) : View(context
         line.strokeCap = Paint.Cap.ROUND
         solid.color = Gloss.GLASS_BOTTOM
         c.drawCircle(cx, cy, s * 0.28f, solid)                                   // center hole
+    }
+}
+
+/**
+ * The focus ring that pops up where you tap to focus: a thin polished
+ * silver ring, bright on top and darker underneath like everything else,
+ * with a soft shadow just below it and a small black glass dot in the
+ * middle. MainActivity places it, shrinks it in, and fades it out.
+ */
+class FocusRing(context: Context) : View(context) {
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+    private val dot = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    override fun onDraw(c: Canvas) {
+        val cx = width / 2f; val cy = height / 2f
+        val r = min(width, height) / 2f - 6f
+        val sw = r * 0.09f
+        // Shadow under the ring (light from above)
+        p.shader = null; p.color = Color.argb(110, 0, 0, 0); p.strokeWidth = sw * 1.4f
+        c.drawCircle(cx, cy + 3f, r, p)
+        // The silver ring itself
+        p.shader = Gloss.silver(cy - r, cy + r); p.strokeWidth = sw
+        c.drawCircle(cx, cy, r, p)
+        // Small center dot
+        dot.shader = RadialGradient(cx, cy - r * 0.04f, r * 0.12f, Gloss.GLASS_TOP, Gloss.GLASS_BOTTOM, Shader.TileMode.CLAMP)
+        c.drawCircle(cx, cy, r * 0.09f, dot)
+        p.shader = Gloss.silver(cy - r * 0.09f, cy + r * 0.09f); p.strokeWidth = 2f
+        c.drawCircle(cx, cy, r * 0.09f, p)
     }
 }

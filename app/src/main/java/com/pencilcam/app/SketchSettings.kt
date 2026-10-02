@@ -1,6 +1,8 @@
 package com.pencilcam.app
 
 import android.content.SharedPreferences
+import org.json.JSONArray
+import org.json.JSONObject
 import kotlin.math.pow
 
 /**
@@ -43,15 +45,37 @@ data class SketchSettings(
     var damageSeed: Float = 17f,
     /** Polaroid caption: 0 off, 1 today's date, 2 custom text. */
     var captionMode: Int = 0,
-    var captionText: String = ""
+    var captionText: String = "",
+    /** Mix slider for each look: 1 = all look, 0 = the plain picture. */
+    var mix: FloatArray = FloatArray(Looks.count) { 1f }
 ) {
+    /** The Mix value for one look. */
+    fun mixFor(style: Int): Float = mix.getOrElse(style) { 1f }
     /**
      * A fully separate copy. Plain copy() would share the lists above, so
      * a slider moving on the main thread could change a value halfway
      * through the GPU thread drawing a frame. The renderer always gets one of these.
      */
     fun snapshot(): SketchSettings = copy(
-        lookParams = lookParams.copyOf(), finishOn = finishOn.copyOf(), finishParams = finishParams.copyOf())
+        lookParams = lookParams.copyOf(), finishOn = finishOn.copyOf(), finishParams = finishParams.copyOf(),
+        mix = mix.copyOf())
+
+    /**
+     * The whole look written out as JSON text, for Favorites. Everything
+     * except Mirror image and the camera rotation fix, which belong to the
+     * phone and camera, not to the look.
+     */
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("style", style); put("strength", strength.toDouble()); put("detail", detail.toDouble())
+        put("width", width.toDouble()); put("hatch", hatch.toDouble()); put("spacing", spacing.toDouble())
+        put("boil", boil.toDouble()); put("boilFps", boilFps.toDouble()); put("holdFrames", holdFrames)
+        put("grain", grain.toDouble()); put("ink", ink); put("neonColor", neonColor)
+        put("damageSeed", damageSeed.toDouble()); put("captionMode", captionMode); put("captionText", captionText)
+        put("lookParams", JSONArray(lookParams.map { it.toDouble() }))
+        put("finishOn", JSONArray(finishOn.toList()))
+        put("finishParams", JSONArray(finishParams.map { it.toDouble() }))
+        put("mix", JSONArray(mix.map { it.toDouble() }))
+    }
 
     /** One of the current look's own settings (i = 0 to 3). */
     fun lookParam(i: Int): Float = lookParams[style * Looks.PARAMS + i]
@@ -94,12 +118,52 @@ data class SketchSettings(
         lookParams.forEachIndexed { i, v -> e.putFloat("look4_$i", v) }
         e.putInt("neonColor", neonColor).putFloat("damageSeed", damageSeed)
             .putInt("captionMode", captionMode).putString("captionText", captionText)
+        mix.forEachIndexed { i, v -> e.putFloat("mix_$i", v) }
         finishOn.forEachIndexed { i, on -> e.putBoolean("finOn_$i", on) }
         finishParams.forEachIndexed { i, v -> e.putFloat("finVal_$i", v) }
         e.apply()
     }
 
     companion object {
+        /**
+         * Rebuild a look from Favorites JSON. Mirror and rotation fix come
+         * from `keep` (the current settings). Anything missing from an older
+         * favorite falls back to the defaults, and lists are matched up slot
+         * by slot so a favorite saved before new looks were added still loads.
+         */
+        fun fromJson(o: JSONObject, keep: SketchSettings): SketchSettings {
+            val d = SketchSettings()
+            fun floats(key: String, def: FloatArray): FloatArray {
+                val a = o.optJSONArray(key) ?: return def
+                return FloatArray(def.size) { i -> if (i < a.length()) a.optDouble(i, def[i].toDouble()).toFloat() else def[i] }
+            }
+            val on = o.optJSONArray("finishOn")
+            return SketchSettings(
+                style = o.optInt("style", d.style).coerceIn(0, Looks.count - 1),
+                strength = o.optDouble("strength", d.strength.toDouble()).toFloat(),
+                detail = o.optDouble("detail", d.detail.toDouble()).toFloat(),
+                width = o.optDouble("width", d.width.toDouble()).toFloat(),
+                hatch = o.optDouble("hatch", d.hatch.toDouble()).toFloat(),
+                spacing = o.optDouble("spacing", d.spacing.toDouble()).toFloat(),
+                boil = o.optDouble("boil", d.boil.toDouble()).toFloat(),
+                boilFps = o.optDouble("boilFps", d.boilFps.toDouble()).toFloat().coerceIn(1f, 30f),
+                holdFrames = o.optBoolean("holdFrames", d.holdFrames),
+                grain = o.optDouble("grain", d.grain.toDouble()).toFloat(),
+                ink = o.optInt("ink", d.ink),
+                mirror = keep.mirror, rotationFix = keep.rotationFix,
+                lookParams = floats("lookParams", d.lookParams).also { a ->
+                    for (i in a.indices) a[i] = Looks.clampParam(i / Looks.PARAMS, i % Looks.PARAMS, a[i])
+                },
+                finishOn = BooleanArray(d.finishOn.size) { i -> on != null && i < on.length() && on.optBoolean(i) },
+                finishParams = floats("finishParams", d.finishParams),
+                neonColor = o.optInt("neonColor", d.neonColor),
+                damageSeed = o.optDouble("damageSeed", d.damageSeed.toDouble()).toFloat(),
+                captionMode = o.optInt("captionMode", d.captionMode).coerceIn(0, 2),
+                captionText = o.optString("captionText", d.captionText),
+                mix = floats("mix", d.mix).also { a -> for (i in a.indices) a[i] = a[i].coerceIn(0f, 1f) }
+            )
+        }
+
         /** Any ARGB color split into red, green, blue from 0 to 1. */
         fun rgb(c: Int): FloatArray = floatArrayOf(((c shr 16) and 0xFF) / 255f, ((c shr 8) and 0xFF) / 255f, (c and 0xFF) / 255f)
 
@@ -131,6 +195,7 @@ data class SketchSettings(
                 damageSeed = p.getFloat("damageSeed", d.damageSeed),
                 captionMode = p.getInt("captionMode", d.captionMode).coerceIn(0, 2),
                 captionText = p.getString("captionText", d.captionText) ?: "",
+                mix = FloatArray(d.mix.size) { i -> p.getFloat("mix_$i", 1f).coerceIn(0f, 1f) },
                 finishOn = BooleanArray(d.finishOn.size) { i -> p.getBoolean("finOn_$i", false) },
                 finishParams = FloatArray(d.finishParams.size) { i -> p.getFloat("finVal_$i", d.finishParams[i]) }
             )
