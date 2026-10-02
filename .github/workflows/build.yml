@@ -1,3 +1,9 @@
+# ============================================================================
+# GitHub Actions workflow: builds the APK on GitHub's servers.
+# The project now lives directly in the repo (no more PencilCam-src.zip),
+# so Claude Code can edit, commit, and push real files.
+# Every push to main builds a fresh APK under Actions > Artifacts.
+# ============================================================================
 name: Build APK
 
 on:
@@ -9,25 +15,26 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # 1. Grab the repo
       - uses: actions/checkout@v4
 
-      - name: Unpack project
-        run: unzip -o -q PencilCam-src.zip -d build-src
-
+      # 2. Install Java 17
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
+      # 3. Install Gradle (GitHub's machines already have the Android SDK)
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
 
+      # 4. Build the APK from the repo root
       - name: Build debug APK
-        working-directory: build-src/PencilCam
         run: gradle assembleDebug --no-daemon --stacktrace
 
+      # 5. Save the APK so you can download it
       - uses: actions/upload-artifact@v4
         with:
           name: PencilCam-apk
-          path: build-src/PencilCam/app/build/outputs/apk/debug/*.apk
+          path: app/build/outputs/apk/debug/*.apk
