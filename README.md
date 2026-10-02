@@ -1,6 +1,6 @@
 <img src="design/viewsmith-icon-512.png" width="128" align="right" alt="ViewSmith icon">
 
-# ViewSmith v0.5
+# ViewSmith v0.6
 
 ViewSmith is a camera app that redraws what it sees by hand. Point it at something and the
 screen shows it as a pencil sketch, a watercolor, an oil painting, a neon sign, an old west
@@ -40,7 +40,9 @@ menus turn themselves to face you, so the camera never restarts in the middle of
 - **Finish**: vignette, matte, glossy, and polaroid. Each has an On switch and two sliders,
   and you can stack any number of them. When any are on, the Finish tab glows silver and
   shows how many.
-- **Lines**: ink color, and how dark, how detailed, and how soft the outlines are
+- **Lines**: ink color, and how dark, how detailed, and how soft the outlines are. With Neon
+  edges picked, the ink colors become neon tube colors: hot pink, electric blue, lime, purple,
+  orange, and white.
 - **Shade**: how much crosshatching, and how far apart the strokes are
 - **Paper**: how much paper grain shows through
 - **Motion**: how much the lines wobble and how often they redraw, from 1 to 30 times a
@@ -59,16 +61,16 @@ seconds showing what's stacked, like "Watercolor + Vignette + Polaroid".
 | Colored pencil | Strokes take on the colors of the picture | uses Lines, Shade, Paper |
 | Comic | Flat bold colors, heavy outlines, dots in the shadows | Color levels, Shadow dots, Outline weight |
 | Halftone | Printed in cyan, magenta, yellow, and black dots like an old newspaper photo | Dot size, Color, Outlines |
-| Watercolor | Soft washes that bleed past the edges, with paint pooling where a wash ends | Bleed, Color strength, Edge pooling |
+| Watercolor | Soft washes that slip past the pencil lines, pool darker where a wash dries, and settle into the paper grain | Bleed, Color strength, Edge pooling |
 | Chalkboard | White chalk on a green slate board | Chalk shading, Board darkness, Chalk dust |
-| Oil painting | Smooth patches of paint with sharp edges, canvas weave, and brush streaks | Brush size, Color richness, Canvas texture |
-| Neon edges | Every edge glows like a neon tube on a black background | Glow, Hue, Rainbow |
+| Oil painting | Brush strokes that follow the shapes in the picture, raised paint lit from above, a painter's limited palette, and canvas weave | Brush size, Impasto depth, Canvas |
+| Neon edges | Every edge glows like a neon tube on a black background. Modes: Solid (your color), Rainbow (sweeps across the picture and slowly cycles), Two-tone (white-hot core, colored glow), Scene color (the real colors, boosted bright) | Glow, Mode, Rainbow speed; color on the Lines tab |
 | Crayon edges | Thick waxy outlines and loose colored scribbles, with paper showing through the wax | Stroke thickness, Color fill, Wax texture |
-| Old west | A sepia tintype with uneven plate chemistry, scratches, and dust | Sepia, Scratches and dust, Plate wear |
+| Old west | An old sepia photograph. Wear runs from light fading, to a fold crease and rubbed corners, to cross folds with cracked emulsion, chipped edges, a dog-eared corner, and age spots. Creases catch the light on top with a shadow below | Sepia, Scratches, Wear, Damage (Print or Film), New damage button |
 | Inverted | A color negative | Contrast, Color, Outlines |
-| Predator vision | A fake heat camera: bright and busy spots glow hot | Edge heat, Contrast, Scan lines |
+| Predator vision | A fake heat camera: bright and busy spots glow hot | Edge heat, Contrast, Scan lines, Palette (Ironbow, White-hot, Black-hot, Rainbow) |
 
-Oil painting does the most work per frame of any look. On an older phone it may not keep up
+Oil painting does the most work per frame of any look (two extra paint passes). On an older phone it may not keep up
 at the higher video sizes; if so, ViewSmith drops the recording size and says so.
 
 Predator vision isn't measuring heat. It maps brightness and edges onto heat camera colors.
@@ -80,10 +82,17 @@ Predator vision isn't measuring heat. It maps brightness and edges onto heat cam
 | Vignette | Darkens toward the corners | Amount, Size |
 | Matte | Lifted blacks and calmer color, like a matte print | Fade, Soften |
 | Glossy | Deeper color plus a shine across the top, lit from above | Shine, Punch |
-| Polaroid | A white card border, thick along the bottom, with faded warm tones | Frame, Faded tones |
+| Polaroid | A white card border, thick along the bottom, with faded warm tones, and an optional handwritten caption | Frame, Faded tones, Caption (Off, Today's date, or Custom) |
 
 The polaroid's thick edge and the glossy shine always go on the bottom and top as you're
-holding the phone, so they come out the right way up in the saved picture.
+holding the phone, so they come out the right way up in the saved picture. The caption is
+written in a handwriting font (Caveat, which ships with the app so it looks the same on every
+phone). "Today's date" is written like "Oct 2, 2026".
+
+Old west's **Print** mode keeps the damage still, the way it would be on a real print, even
+through a whole video. **Film** mode makes vertical scratches and dust flicker frame to frame
+like an old reel. **New damage** shuffles the folds, scratches, and spots; it's locked while
+recording or saving so the damage can't jump mid-video.
 
 ### Settings (the cog)
 
@@ -102,18 +111,23 @@ The gear in the bottom-left corner (it moves to stay in *your* bottom-left as yo
 
 The back gesture closes an open menu first.
 
-## What's new in v0.5
+## What's new in v0.6
 
-- Six new looks: Oil painting, Neon edges, Crayon edges, Old west, Inverted, Predator vision.
-  Comic, Halftone, Watercolor, and Chalkboard now have their own sliders too.
-- New Finish tab: vignette, matte, glossy, and polaroid, stackable on any look
-- A label over the viewfinder shows the current look and finishes whenever they change
-- Videos record at 1080p by default, with 720p, 1440p, and 4K in Settings
-- Works on phones other than Samsung (Pixel and others): checks what the camera and video
-  encoder can actually do and falls back instead of failing
-- "Redraws per second" now goes down to 1 for a slow flipbook feel
+- **Neon edges**: neon tube colors on the Lines tab, and four modes: Solid, Rainbow (slowly
+  cycling), Two-tone (white-hot core), and Scene color
+- **Oil painting**: rebuilt so it looks painted, not photographic. Strokes follow the shapes in
+  the picture, the paint is raised and lit from above (impasto), the palette is limited and
+  richer, with a subtle canvas weave. The paint is laid down at half size and stretched back up,
+  which keeps it fast and soft.
+- **Old west**: scratches at random angles, a Wear slider from light fading up to folds,
+  cracks, chips, dog-ears, and age spots, Print or Film damage, and a New damage button
+- **Predator vision**: four palettes, Ironbow, White-hot, Black-hot, and Rainbow
+- **Watercolor**: darker pooled edges, more bleed past the lines, pigment settling in the grain
+- **Polaroid**: an optional handwritten caption, today's date or your own words
 
-Earlier: v0.4 renamed the app ViewSmith, added videos in File mode, and four styles. v0.3
+v0.5 added six looks, the Finish tab, the look label, video resolution choices, support for
+phones other than Samsung, and redraws down to 1 per second. v0.4 renamed the app ViewSmith,
+added videos in File mode, and four styles. v0.3
 added the menus that turn with the phone and the Settings cog. v0.2 added the dial, video
 recording, File mode for photos, and the side tabs.
 
@@ -176,4 +190,5 @@ along with the release key.
 | `VideoRecorder.kt` | Recording in Video mode, and checking what the phone's video encoder can do |
 | `ModeDial.kt` | The silver dial shutter |
 | `Gloss.kt` | The black glass and silver look for every control |
-| `design/` | The icon artwork |
+| `design/` | The icon artwork, and the license for the Caveat handwriting font |
+| `res/font/caveat.ttf` | The handwriting font for polaroid captions (SIL Open Font License) |

@@ -154,8 +154,22 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
     /** arrivedFps = camera frames per second, drawnFps = frames the GPU kept up with, at size w x h. */
     class Perf(val arrivedFps: Float, val drawnFps: Float, val w: Int, val h: Int)
 
+    // ---- Polaroid caption: the handwriting, drawn by the screen into a
+    // Bitmap and uploaded here as a texture
+    @Volatile private var pendingCaption: Bitmap? = null
+    @Volatile private var captionChanged = false
+    private var lastCaption: Bitmap? = null
+    private var capTex = 0
+
+    // ---- Oil painting: two extra passes at half size (gradients, then paint)
+    private var oilGradT: Target? = null; private var oilPaintT: Target? = null
+
+    /** The clock (seconds) for this frame, handed to the shader for slow cycling effects. */
+    private var timeSec = 0f
+
     // ---- Shader programs, the full screen rectangle, and the off-screen images
     private var pCopy = 0; private var pCopy2D = 0; private var pBlurH = 0; private var pBlurV = 0; private var pDraw = 0
+    private var pOilGrad = 0; private var pOilPaint = 0
     private lateinit var quad: FloatBuffer
     /** An off-screen image the GPU can draw into (framebuffer + texture). */
     private class Target(val fb: Int, val tex: Int, val w: Int, val h: Int)
@@ -178,6 +192,8 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
         view.requestRender()
     }
     fun showBitmap(b: Bitmap) { pendingBitmap = b; view.requestRender() }
+    /** New polaroid caption image (1024 x 192, see MainActivity.makeCaption), or null for no caption. */
+    fun setCaption(b: Bitmap?) { pendingCaption = b; captionChanged = true; view.requestRender() }
     fun clearBitmap() { clearBitmapReq = true; view.requestRender() }
 
     /**
@@ -218,6 +234,12 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
         pBlurH = program(Shaders.QUAD_VS, Shaders.BLUR_H_FS)
         pBlurV = program(Shaders.QUAD_VS, Shaders.BLUR_V_FS)
         pDraw = program(Shaders.DRAW_VS, Shaders.DRAW_FS)
+        pOilGrad = program(Shaders.QUAD_VS, Shaders.OIL_GRAD_FS)
+        pOilPaint = program(Shaders.QUAD_VS, Shaders.OIL_PAINT_FS)
+        oilGradT = null; oilPaintT = null
+        // The caption texture went with the old context too; upload it again
+        capTex = 0
+        if (lastCaption != null && !captionChanged) { pendingCaption = lastCaption; captionChanged = true }
 
         // This runs on first start, and again if Android ever throws away the
         // GPU context. Either way, any old textures are gone, so start clean
@@ -239,6 +261,7 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
 
         // Pick up any notes left by other threads
         handleBitmapRequests()
+        handleCaption()
         handleVideoRequests()
         connectPendingCamera()
         handleStopRecording()
@@ -352,6 +375,14 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
         GLES20.glUniform2f(loc(pBlurV, "u_texel"), k / w, k / h)
         GLES20.glUniform1f(loc(pBlurV, "u_s1"), s.width)
         drawQuad()
+
+        // ---- Oil painting only: lay down the paint at half size (see OIL_PAINT_FS).
+        // Half size means a quarter of the work, and stretching it back up in
+        // Pass 3 softens it the way real paint is soft.
+        if (s.style == Looks.OIL) paintOil(s, src, w, h, k)
+
+        // The shader's clock: seconds, wrapped every hour so the number stays small
+        timeSec = ((now / 1_000_000_000.0) % 3600.0).toFloat()
 
         // ---- Pass 3 to the screen, fitted inside the view with black bars if needed
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
@@ -470,6 +501,49 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
         lastBitmap = bmp; useBitmap = true; srcValid = false
     }
 
+    /** Oil passes A and B into the two half-size images (made or remade when the size changes). */
+    private fun paintOil(s: SketchSettings, src: Target, w: Int, h: Int, k: Float) {
+        val hw = max(w / 2, 1); val hh = max(h / 2, 1)
+        if (oilGradT?.w != hw || oilGradT?.h != hh || oilPaintT == null) {
+            oilGradT?.let(::deleteTarget); oilPaintT?.let(::deleteTarget)
+            oilGradT = makeTarget(hw, hh, halfFloat = false)
+            oilPaintT = makeTarget(hw, hh, halfFloat = false)
+        }
+        val g = oilGradT ?: return; val p = oilPaintT ?: return
+        // A: brightness gradients
+        bindTarget(g); GLES20.glUseProgram(pOilGrad)
+        bindTex(0, src.tex); GLES20.glUniform1i(loc(pOilGrad, "u_src"), 0)
+        GLES20.glUniform2f(loc(pOilGrad, "u_texel"), 1f / hw, 1f / hh)
+        drawQuad()
+        // B: the paint
+        bindTarget(p); GLES20.glUseProgram(pOilPaint)
+        bindTex(0, src.tex); GLES20.glUniform1i(loc(pOilPaint, "u_src"), 0)
+        bindTex(1, g.tex); GLES20.glUniform1i(loc(pOilPaint, "u_grad"), 1)
+        GLES20.glUniform2f(loc(pOilPaint, "u_res"), w / k, h / k)
+        GLES20.glUniform2f(loc(pOilPaint, "u_gtexel"), 1f / hw, 1f / hh)
+        GLES20.glUniform1f(loc(pOilPaint, "u_brush"), s.lookParam(0))
+        drawQuad()
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+    }
+
+    /** Upload a new caption image, or drop it. */
+    private fun handleCaption() {
+        if (!captionChanged) return
+        captionChanged = false
+        val bmp = pendingCaption
+        pendingCaption = null
+        if (capTex != 0) { GLES20.glDeleteTextures(1, intArrayOf(capTex), 0); capTex = 0 }
+        lastCaption = bmp
+        if (bmp == null) return
+        val t = IntArray(1); GLES20.glGenTextures(1, t, 0); capTex = t[0]
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, capTex)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+    }
+
     private fun handleVideoRequests() {
         if (clearVideoReq) { clearVideoReq = false; releaseVideo() }
         val r = pendingVideo ?: return
@@ -585,7 +659,15 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
     private fun drawSketch(s: SketchSettings, src: Target, blur: Target, w: Int, h: Int, k: Float, turn: Boolean = false) {
         GLES20.glUseProgram(pDraw)
         GLES20.glUniform1f(loc(pDraw, "u_turn"), if (turn) 1f else 0f)
-        GLES20.glUniform3f(loc(pDraw, "u_p"), s.lookParam(0), s.lookParam(1), s.lookParam(2))
+        GLES20.glUniform4f(loc(pDraw, "u_p"), s.lookParam(0), s.lookParam(1), s.lookParam(2), s.lookParam(3))
+        GLES20.glUniform1f(loc(pDraw, "u_time"), timeSec)
+        GLES20.glUniform1f(loc(pDraw, "u_dmg"), s.damageSeed)
+        // Oil paint (unit 2) and caption (unit 3). When they aren't in use,
+        // point those slots at the source picture so they're never empty.
+        val paint = if (s.style == Looks.OIL) oilPaintT?.tex ?: src.tex else src.tex
+        bindTex(2, paint); GLES20.glUniform1i(loc(pDraw, "u_paint"), 2)
+        bindTex(3, if (capTex != 0) capTex else src.tex); GLES20.glUniform1i(loc(pDraw, "u_caption"), 3)
+        GLES20.glUniform1f(loc(pDraw, "u_capOn"), if (capTex != 0) 1f else 0f)
         val on = s.finishOn; val fp = s.finishParams
         fun b(i: Int) = if (on[i]) 1f else 0f
         GLES20.glUniform4f(loc(pDraw, "u_finOn"), b(0), b(1), b(2), b(3))
@@ -603,7 +685,8 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
         GLES20.glUniform1f(loc(pDraw, "u_boil"), if (animate) s.boil else 0f)
         GLES20.glUniform1f(loc(pDraw, "u_grain"), s.grain)
         GLES20.glUniform1f(loc(pDraw, "u_style"), s.style.toFloat())
-        val ink = s.inkRgb()
+        // Neon edges uses the neon color picked on the Lines tab instead of the ink
+        val ink = if (s.style == Looks.NEON) SketchSettings.rgb(s.neonColor) else s.inkRgb()
         GLES20.glUniform3f(loc(pDraw, "u_ink"), ink[0], ink[1], ink[2])
         drawQuad()
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)

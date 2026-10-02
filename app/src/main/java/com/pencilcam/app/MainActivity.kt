@@ -27,7 +27,12 @@ import android.view.Surface
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.text.Editable
+import android.text.InputFilter
+import android.text.TextWatcher
+import android.view.inputmethod.EditorInfo
 import android.widget.CheckBox
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.RadioButton
@@ -47,6 +52,7 @@ import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
+import androidx.core.content.res.ResourcesCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -243,6 +249,7 @@ class MainActivity : AppCompatActivity() {
         super.onResume(); glView.onResume()
         if (orientationListener.canDetectOrientation()) orientationListener.enable()
         if (mode == ModeDial.FILE && videoSurface != null) startPlayer()
+        updateCaption()                                      // also refreshes "today's date" after midnight
     }
     override fun onPause() {
         orientationListener.disable()
@@ -1101,7 +1108,7 @@ class MainActivity : AppCompatActivity() {
                 button("Reset all sliders") {
                     settings = SketchSettings(mirror = settings.mirror, rotationFix = settings.rotationFix)
                     pushSettings(); refreshers.forEach { it() }; buildLookBox()
-                    updateFinishBadge(); showLookLabel()
+                    updateFinishBadge(); updateCaption(); showLookLabel()
                 }
             }
             "Finish" -> {
@@ -1111,31 +1118,62 @@ class MainActivity : AppCompatActivity() {
                     heading(fname)
                     check("On", { settings.finishOn[f] }, {
                         settings.finishOn[f] = it
-                        updateFinishBadge(); showLookLabel()
+                        updateFinishBadge(); updateCaption(); showLookLabel()
                     })
                     Looks.finishParams[f].forEachIndexed { i, p ->
                         slider(p.label, p.min, p.max, p.step,
                             { settings.finishParams[f * 2 + i] }, { settings.finishParams[f * 2 + i] = it }, p.fmt)
                     }
+                    if (f == Looks.POLAROID) captionControls()
                 }
             }
             "Lines" -> {
-                heading("Ink color")
-                val inks = listOf(0xFF3D4049, 0xFF10121A, 0xFF1F3F9E, 0xFF6B4A2B, 0xFFB3261E, 0xFF1E6B45).map { it.toInt() }
-                val row = LinearLayout(this)
-                val dots = inks.map { c ->
-                    View(this).apply {
-                        layoutParams = LinearLayout.LayoutParams(dp(32), dp(32)).apply { marginEnd = dp(10) }
-                        setOnClickListener { settings.ink = c; pushSettings(); refreshers.forEach { it() } }
-                        row.addView(this)
+                if (settings.style == Looks.NEON) {
+                    // Neon edges: bright tube colors instead of pen inks. Each
+                    // swatch glows in its own color so it reads as lit up.
+                    heading("Neon color")
+                    val neon = Looks.neonColors.map { it.second }
+                    val row = LinearLayout(this)
+                    val dots = neon.map { c ->
+                        View(this).apply {
+                            layoutParams = LinearLayout.LayoutParams(dp(32), dp(32)).apply { marginEnd = dp(10) }
+                            setOnClickListener { settings.neonColor = c; pushSettings(); refreshers.forEach { it() } }
+                            row.addView(this)
+                        }
                     }
-                }
-                panelContent.addView(row)
-                refreshers += {
-                    dots.forEachIndexed { i, v ->
-                        v.background = GradientDrawable().apply {
-                            shape = GradientDrawable.OVAL; setColor(inks[i])
-                            setStroke(dp(3), if (inks[i] == settings.ink) Gloss.SILVER_HI else Color.argb(90, 255, 255, 255))
+                    panelContent.addView(row)
+                    refreshers += {
+                        dots.forEachIndexed { i, v ->
+                            v.contentDescription = Looks.neonColors[i].first
+                            // Bright center fading to the color at the rim, like a lit bulb
+                            v.background = GradientDrawable().apply {
+                                shape = GradientDrawable.OVAL
+                                gradientType = GradientDrawable.RADIAL_GRADIENT
+                                gradientRadius = dp(16).toFloat()
+                                colors = intArrayOf(Color.WHITE, neon[i], neon[i])
+                                setStroke(dp(3), if (neon[i] == settings.neonColor) Gloss.SILVER_HI else Color.argb(70, 255, 255, 255))
+                            }
+                        }
+                    }
+                    note("Solid and Two-tone use this color. Mode is on the Style tab.")
+                } else {
+                    heading("Ink color")
+                    val inks = listOf(0xFF3D4049, 0xFF10121A, 0xFF1F3F9E, 0xFF6B4A2B, 0xFFB3261E, 0xFF1E6B45).map { it.toInt() }
+                    val row = LinearLayout(this)
+                    val dots = inks.map { c ->
+                        View(this).apply {
+                            layoutParams = LinearLayout.LayoutParams(dp(32), dp(32)).apply { marginEnd = dp(10) }
+                            setOnClickListener { settings.ink = c; pushSettings(); refreshers.forEach { it() } }
+                            row.addView(this)
+                        }
+                    }
+                    panelContent.addView(row)
+                    refreshers += {
+                        dots.forEachIndexed { i, v ->
+                            v.background = GradientDrawable().apply {
+                                shape = GradientDrawable.OVAL; setColor(inks[i])
+                                setStroke(dp(3), if (inks[i] == settings.ink) Gloss.SILVER_HI else Color.argb(90, 255, 255, 255))
+                            }
                         }
                     }
                 }
@@ -1165,6 +1203,71 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * Polaroid caption: Off, Today's date, or Custom, plus a text box for
+     * the custom words. The text box only shows when Custom is picked.
+     */
+    private fun captionControls() {
+        val box = EditText(this).apply {
+            setText(settings.captionText)
+            hint = "Write a caption"
+            setTextColor(Gloss.SILVER_HI); setHintTextColor(Gloss.TEXT_DIM); textSize = 14f; shade()
+            backgroundTintList = ColorStateList.valueOf(Gloss.SILVER_1)    // silver underline
+            isSingleLine = true
+            imeOptions = EditorInfo.IME_ACTION_DONE
+            filters = arrayOf(InputFilter.LengthFilter(40))
+            visibility = if (settings.captionMode == 2) View.VISIBLE else View.GONE
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(t: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun onTextChanged(t: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun afterTextChanged(e: Editable?) {
+                    val txt = e?.toString() ?: ""
+                    if (txt != settings.captionText) { settings.captionText = txt; settings.save(prefs); updateCaption() }
+                }
+            })
+        }
+        choiceRow("Caption", Looks.captionModes, { settings.captionMode }, {
+            settings.captionMode = it
+            box.visibility = if (it == 2) View.VISIBLE else View.GONE
+            updateCaption()
+        })
+        target.addView(box, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+    }
+
+    /** What the caption should say right now, or "" for none. */
+    private fun captionWords(): String = when (settings.captionMode) {
+        1 -> SimpleDateFormat("MMM d, yyyy", Locale.getDefault()).format(Date())
+        2 -> settings.captionText.trim()
+        else -> ""
+    }
+
+    /**
+     * Write the caption by hand (in the Caveat handwriting font that ships
+     * with the app) into a 1024 x 192 image and hand it to the renderer,
+     * which lays it on the polaroid's bottom border. Dark blue-black like a
+     * felt pen, tilted a degree or two because nobody writes perfectly level.
+     */
+    private fun updateCaption() {
+        val words = captionWords()
+        if (words.isEmpty()) { renderer.setCaption(null); return }
+        val bmp = Bitmap.createBitmap(1024, 192, Bitmap.Config.ARGB_8888)
+        val c = android.graphics.Canvas(bmp)
+        val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#1E2A4A")
+            typeface = try { ResourcesCompat.getFont(this@MainActivity, R.font.caveat) } catch (e: Exception) { null }
+                ?: android.graphics.Typeface.create("casual", android.graphics.Typeface.NORMAL)
+            textAlign = android.graphics.Paint.Align.CENTER
+            textSize = 150f
+        }
+        // Shrink long captions until they fit the width
+        while (paint.measureText(words) > 980f && paint.textSize > 40f) paint.textSize -= 6f
+        c.rotate(-1.5f, 512f, 96f)
+        val fm = paint.fontMetrics
+        c.drawText(words, 512f, 96f - (fm.ascent + fm.descent) / 2f, paint)
+        renderer.setCaption(bmp)
+        glView.requestRender()
+    }
+
+    /**
      * Fill the Style tab's look box with the chosen look's own sliders.
      * The row builders add to whatever `target` is, so point it at the box
      * for a moment, then put it back.
@@ -1178,7 +1281,18 @@ class MainActivity : AppCompatActivity() {
         val params = Looks.params[settings.style]
         if (params.isNotEmpty()) heading("${Looks.names[settings.style]} settings")
         params.forEachIndexed { i, p ->
-            slider(p.label, p.min, p.max, p.step, { settings.lookParam(i) }, { settings.setLookParam(i, it) }, p.fmt)
+            val names = p.choices
+            if (names != null) choiceRow(p.label, names, { settings.lookParam(i).roundToInt() }, { settings.setLookParam(i, it.toFloat()) })
+            else slider(p.label, p.min, p.max, p.step, { settings.lookParam(i) }, { settings.setLookParam(i, it) }, p.fmt)
+        }
+        if (settings.style == Looks.OLD_WEST) {
+            // A new random layout of folds, scratches, spots, and chips. Not
+            // while recording or saving: the damage would jump mid-video.
+            button("New damage") {
+                if (recording || exporting) { toast("Can't change the damage while recording or saving."); return@button }
+                settings.damageSeed = (settings.damageSeed + 1f + (Math.random() * 97).toFloat()) % 997f
+                pushSettings()
+            }
         }
         note(Looks.hint(settings.style))
         boxRefreshers.forEach { it() }
@@ -1249,6 +1363,23 @@ class MainActivity : AppCompatActivity() {
             bar.progress = p; title.text = "$label: ${fmt(value(p))}"
         }
     }
+    /** A pick-one setting: a label and a column of radio buttons. Takes effect right away. */
+    private fun choiceRow(label: String, names: List<String>, get: () -> Int, set: (Int) -> Unit) {
+        target.addView(TextView(this).apply { text = label; setTextColor(Gloss.TEXT); textSize = 13f; shade() })
+        val group = RadioGroup(this)
+        names.forEachIndexed { i, n ->
+            group.addView(RadioButton(this).apply {
+                id = 3000 + i; text = n; setTextColor(Gloss.TEXT); shade()
+                buttonTintList = ColorStateList.valueOf(Gloss.SILVER_1)
+            })
+        }
+        group.setOnCheckedChangeListener { _, id ->
+            if (id >= 3000 && id - 3000 != get()) { set(id - 3000); pushSettings() }
+        }
+        target.addView(group)
+        targetRefreshers += { group.check(3000 + get()) }
+    }
+
     private fun check(label: String, get: () -> Boolean, set: (Boolean) -> Unit) {
         val box = CheckBox(this).apply { text = label; setTextColor(Gloss.TEXT); buttonTintList = ColorStateList.valueOf(Gloss.SILVER_1); shade() }
         box.setOnCheckedChangeListener { _, on -> if (on != get()) { set(on); pushSettings() } }

@@ -11,7 +11,7 @@ Owner: Rodger. First Android app, so explain Android-specific steps plainly.
 Test phone: Samsung Galaxy S24 Ultra. Must ALSO work on Google Pixel and other phones: no Samsung-only
 APIs, check camera/encoder capabilities and fall back, shaders stay GLSL ES 1.00 (runs on any ES 3.0 GPU).
 
-## Current state: v0.5 (versionCode 5)
+## Current state: v0.6 (versionCode 6)
 - v0.1: live sketch shader on camera feed.
 - v0.2: glossy silver/black-glass UI, ModeDial shutter (drag ring: PHOTO / VIDEO / FILE),
   video recording with sound, File mode for photos, side tabs (Style, Lines, Shade, Paper,
@@ -29,7 +29,19 @@ APIs, check camera/encoder capabilities and fall back, shaders stay GLSL ES 1.00
   glossy, polaroid, stackable (finishOn/finishParams -> u_finOn/u_finA/u_finB); tab badge
   + 2 s look label. Video resolution setting 720/1080/1440/4K (default 1080), encoder
   check + GPU keep-up check step down with a toast. Redraws per second min is 1.
-- v0.4 and v0.5 have NOT been tested on a phone yet. Most likely trouble spots: video rotation
+- v0.6: Looks.PARAMS = 4 (u_p is vec4; saved as look4_N, old look_N migrated on load) and
+  pick-one settings (Param.choices -> radio rows). Neon: neonColor swatches on Lines tab
+  (passed as u_ink), modes Solid/Rainbow/Two-tone/Scene, u_time for cycling. Oil: anisotropic
+  Kuwahara in OIL_GRAD_FS + OIL_PAINT_FS at half size (paint rgb + stroke angle in alpha),
+  impasto lit via upVec() in DRAW_FS. Old west: printScratches(), creases, Wear stages,
+  Print/Film, u_dmg = settings.damageSeed (New damage button, locked while recording/saving).
+  Thermal palettes (u_p.w). Watercolor pooling at the bled wash edge. Polaroid caption:
+  MainActivity.updateCaption() draws res/font/caveat.ttf text into a 1024x192 bitmap ->
+  renderer.setCaption() -> u_caption on the bottom border.
+- Looks can be previewed without a phone: extract the shaders into a WebGL page and
+  screenshot it with headless Edge (--use-angle=swiftshader --enable-unsafe-swiftshader).
+  Also compiles every shader under strict GLSL ES 1.00 first.
+- v0.4 to v0.6 have NOT been tested on a phone yet. Most likely trouble spots: video rotation
   sign in File mode (renderer applies the clip's rotation itself in Pass 0, decoder
   KEY_ROTATION forced to 0), the look of styles 3-12 (tuned by reasoning, never seen),
   shader compile errors (only show at runtime in logcat), polaroid/glossy orientation
@@ -62,6 +74,7 @@ APIs, check camera/encoder capabilities and fall back, shaders stay GLSL ES 1.00
 - Looks.kt: catalog of looks (names, per-look slider specs, hints) and finishes. Order =
   style number = shader u_style; only ever append.
 - Shaders.kt: GLSL ES 1.00. DRAW_VS has u_turn (quarter turn for wide-only encoders).
+  Texture units in DRAW: 0 blur, 1 src, 2 paint (oil), 3 caption.
   DRAW_FS branches on u_style (0..12), then applies finishes in a fixed order. u_frameRot
   (viewer's bottom edge = outRotation(), 0 in File mode) orients the polaroid border
   and glossy shine; polaroid crops the picture into the inner rect.

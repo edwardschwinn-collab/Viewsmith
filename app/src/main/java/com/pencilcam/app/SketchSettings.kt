@@ -31,12 +31,19 @@ data class SketchSettings(
     var ink: Int = 0xFF3D4049.toInt(), // ink color (ARGB)
     var mirror: Boolean = false,    // flip left/right (turns on by itself for the selfie camera)
     var rotationFix: Int = 0,       // extra quarter turns, in case a camera ever shows up sideways
-    /** Every look's own sliders, 3 per look, in look order. */
+    /** Every look's own settings, 4 per look, in look order. */
     var lookParams: FloatArray = Looks.defaultLookParams(),
     /** Which finishes are switched on (vignette, matte, glossy, polaroid). */
     var finishOn: BooleanArray = BooleanArray(Looks.finishCount),
     /** Every finish's two sliders, in finish order. */
-    var finishParams: FloatArray = Looks.defaultFinishParams()
+    var finishParams: FloatArray = Looks.defaultFinishParams(),
+    /** Neon tube color (ARGB), picked on the Lines tab when Neon edges is the look. */
+    var neonColor: Int = Looks.neonColors[0].second,
+    /** Which random damage layout Old west uses. "New damage" picks a new number. */
+    var damageSeed: Float = 17f,
+    /** Polaroid caption: 0 off, 1 today's date, 2 custom text. */
+    var captionMode: Int = 0,
+    var captionText: String = ""
 ) {
     /**
      * A fully separate copy. Plain copy() would share the lists above, so
@@ -46,7 +53,7 @@ data class SketchSettings(
     fun snapshot(): SketchSettings = copy(
         lookParams = lookParams.copyOf(), finishOn = finishOn.copyOf(), finishParams = finishParams.copyOf())
 
-    /** One of the current look's own sliders (i = 0, 1, or 2). */
+    /** One of the current look's own settings (i = 0 to 3). */
     fun lookParam(i: Int): Float = lookParams[style * Looks.PARAMS + i]
     fun setLookParam(i: Int, v: Float) { lookParams[style * Looks.PARAMS + i] = v }
 
@@ -82,13 +89,20 @@ data class SketchSettings(
             .putFloat("boil", boil).putFloat("boilFps", boilFps).putBoolean("holdFrames", holdFrames)
             .putFloat("grain", grain).putInt("ink", ink).putBoolean("mirror", mirror)
             .putInt("rotFix2", rotationFix)
-        lookParams.forEachIndexed { i, v -> e.putFloat("look_$i", v) }
+        // "look4_" because each look now has 4 slots. The old "look_" keys
+        // (3 per look) are only read once, to carry old values across.
+        lookParams.forEachIndexed { i, v -> e.putFloat("look4_$i", v) }
+        e.putInt("neonColor", neonColor).putFloat("damageSeed", damageSeed)
+            .putInt("captionMode", captionMode).putString("captionText", captionText)
         finishOn.forEachIndexed { i, on -> e.putBoolean("finOn_$i", on) }
         finishParams.forEachIndexed { i, v -> e.putFloat("finVal_$i", v) }
         e.apply()
     }
 
     companion object {
+        /** Any ARGB color split into red, green, blue from 0 to 1. */
+        fun rgb(c: Int): FloatArray = floatArrayOf(((c shr 16) and 0xFF) / 255f, ((c shr 8) and 0xFF) / 255f, (c and 0xFF) / 255f)
+
         /** Load the saved values. Anything never saved falls back to the defaults above. */
         fun load(p: SharedPreferences): SketchSettings {
             val d = SketchSettings()
@@ -106,7 +120,17 @@ data class SketchSettings(
                 ink = p.getInt("ink", d.ink),
                 mirror = p.getBoolean("mirror", d.mirror),
                 rotationFix = p.getInt("rotFix2", d.rotationFix),
-                lookParams = FloatArray(d.lookParams.size) { i -> p.getFloat("look_$i", d.lookParams[i]) },
+                lookParams = FloatArray(d.lookParams.size) { i ->
+                    // Slot i belongs to look s, setting n. If it was saved by an
+                    // older version (3 per look), read it from where it used to be.
+                    val s = i / Looks.PARAMS; val n = i % Looks.PARAMS
+                    val old = if (n < 3) p.getFloat("look_${s * 3 + n}", d.lookParams[i]) else d.lookParams[i]
+                    Looks.clampParam(s, n, p.getFloat("look4_$i", old))
+                },
+                neonColor = p.getInt("neonColor", d.neonColor),
+                damageSeed = p.getFloat("damageSeed", d.damageSeed),
+                captionMode = p.getInt("captionMode", d.captionMode).coerceIn(0, 2),
+                captionText = p.getString("captionText", d.captionText) ?: "",
                 finishOn = BooleanArray(d.finishOn.size) { i -> p.getBoolean("finOn_$i", false) },
                 finishParams = FloatArray(d.finishParams.size) { i -> p.getFloat("finVal_$i", d.finishParams[i]) }
             )

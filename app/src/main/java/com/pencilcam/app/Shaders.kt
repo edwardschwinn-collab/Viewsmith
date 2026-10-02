@@ -10,6 +10,8 @@ package com.pencilcam.app
  *                   turn it upright, mirrored if needed, into a normal texture
  *   Pass 1  BLUR H: blur the brightness sideways at two different widths
  *   Pass 2  BLUR V: finish those two blurs top to bottom
+ *   (Oil painting only: two more passes at half size that lay down the
+ *    paint, OIL_GRAD_FS and OIL_PAINT_FS)
  *   Pass 3  DRAW  : build the chosen look, then lay any finishes on top
  *
  * Why two blurs: subtract a wide blur from a narrow blur and what is left
@@ -156,6 +158,95 @@ void main(){
 """
 
     /**
+     * Oil pass A (only when Oil painting is the look). Works at half size.
+     * Finds which way the brightness is changing at each spot (a Sobel
+     * filter: compare the neighbors on the left with the right, and above
+     * with below). Saved as red = sideways change, green = up/down change,
+     * both shifted so 0.5 means "no change".
+     */
+    const val OIL_GRAD_FS = PREC + """
+uniform sampler2D u_src; uniform vec2 u_texel;
+varying vec2 v_uv;
+float L(vec2 o){ return dot(texture2D(u_src, v_uv + o*u_texel).rgb, vec3(0.299,0.587,0.114)); }
+void main(){
+  float tl = L(vec2(-1.0, 1.0)), t = L(vec2(0.0, 1.0)), tr = L(vec2(1.0, 1.0));
+  float l  = L(vec2(-1.0, 0.0)),                        r = L(vec2(1.0, 0.0));
+  float bl = L(vec2(-1.0,-1.0)), b = L(vec2(0.0,-1.0)), br = L(vec2(1.0,-1.0));
+  float gx = (tr + 2.0*r + br - tl - 2.0*l - bl)/4.0;
+  float gy = (tl + 2.0*t + tr - bl - 2.0*b - br)/4.0;
+  gl_FragColor = vec4(gx*0.5 + 0.5, gy*0.5 + 0.5, 0.0, 1.0);
+}
+"""
+
+    /**
+     * Oil pass B: lay down the paint, at half size (Pass 3 stretches it back
+     * up, which also softens it like real paint).
+     *
+     * This is an "anisotropic Kuwahara" filter, which is the plain Kuwahara
+     * idea with the brush turned to follow the picture:
+     *  1. Look at the brightness changes (from pass A) in a 5 x 5 patch
+     *     around this spot and work out the main direction the edges run
+     *     (the "structure tensor" and its eigenvector, a bit of 2 x 2 matrix
+     *     math). Also how strongly they agree on a direction (0 = no
+     *     direction, like a flat wall; 1 = a clean edge).
+     *  2. Lay an oval brush along that direction: longer along the edge,
+     *     narrower across it, more so the stronger the direction.
+     *  3. Split the oval into four quarters, average each one, and keep the
+     *     quarter that's most even. Smooth areas become flat dabs of paint,
+     *     and the strokes run along the shapes instead of in a grid.
+     * Output: paint color in rgb, stroke direction in alpha (0 to 1 = 0 to 180 degrees).
+     */
+    const val OIL_PAINT_FS = PREC + """
+uniform sampler2D u_src; uniform sampler2D u_grad;
+uniform vec2 u_res; uniform vec2 u_gtexel; uniform float u_brush;
+varying vec2 v_uv;
+void main(){
+  // 1. Structure tensor from a 5 x 5 patch of gradients, 2 texels apart
+  float E = 0.0, F = 0.0, G = 0.0;
+  for (int j = -2; j <= 2; j++){
+    for (int i = -2; i <= 2; i++){
+      vec2 g = texture2D(u_grad, v_uv + vec2(float(i), float(j))*2.0*u_gtexel).rg*2.0 - 1.0;
+      E += g.x*g.x; F += g.y*g.y; G += g.x*g.y;
+    }
+  }
+  float disc = sqrt((E - F)*(E - F) + 4.0*G*G);
+  float l1 = 0.5*(E + F + disc), l2 = 0.5*(E + F - disc);
+  vec2 t = vec2(l1 - E, -G);                        // direction the edge runs
+  t = dot(t, t) < 1e-10 ? vec2(1.0, 0.0) : normalize(t);
+  float A = (l1 + l2) > 1e-6 ? (l1 - l2)/(l1 + l2) : 0.0;   // how directional, 0 to 1
+  vec2 n = vec2(-t.y, t.x);
+
+  // 2. The oval brush, in 720 units
+  float ra = u_brush*(1.0 + 1.2*A), rb = u_brush/(1.0 + 1.2*A);
+  vec2 p = v_uv*u_res;
+
+  // 3. Four quarters, 4 x 4 samples each
+  vec3 m0 = vec3(0.0), m1 = vec3(0.0), m2 = vec3(0.0), m3 = vec3(0.0);
+  vec3 s0 = vec3(0.0), s1 = vec3(0.0), s2 = vec3(0.0), s3 = vec3(0.0);
+  for (int j = 0; j < 4; j++){
+    for (int i = 0; i < 4; i++){
+      float ox = float(i)/3.0*ra, oy = float(j)/3.0*rb;
+      vec3 c;
+      c = texture2D(u_src, (p + t*ox + n*oy)/u_res).rgb; m0 += c; s0 += c*c;
+      c = texture2D(u_src, (p - t*ox + n*oy)/u_res).rgb; m1 += c; s1 += c*c;
+      c = texture2D(u_src, (p + t*ox - n*oy)/u_res).rgb; m2 += c; s2 += c*c;
+      c = texture2D(u_src, (p - t*ox - n*oy)/u_res).rgb; m3 += c; s3 += c*c;
+    }
+  }
+  m0 /= 16.0; m1 /= 16.0; m2 /= 16.0; m3 /= 16.0;
+  float v0 = dot(s0/16.0 - m0*m0, vec3(1.0));
+  float v1 = dot(s1/16.0 - m1*m1, vec3(1.0));
+  float v2 = dot(s2/16.0 - m2*m2, vec3(1.0));
+  float v3 = dot(s3/16.0 - m3*m3, vec3(1.0));
+  vec3 best = m0; float bv = v0;
+  if (v1 < bv){ bv = v1; best = m1; }
+  if (v2 < bv){ bv = v2; best = m2; }
+  if (v3 < bv){ bv = v3; best = m3; }
+  gl_FragColor = vec4(best, fract(atan(t.y, t.x)/3.14159265 + 1.0));
+}
+"""
+
+    /**
      * Pass 3: the drawing itself. u_style picks the look (see Looks.names):
      *   0 Pencil, 1 Ink pen, 2 Colored pencil, 3 Comic, 4 Halftone,
      *   5 Watercolor, 6 Chalkboard, 7 Oil painting, 8 Neon edges,
@@ -170,21 +261,27 @@ void main(){
      *   u_strength outline darkness       u_thr     edge threshold (from the Detail slider)
      *   u_hatch    amount of shading      u_spacing stroke spacing
      *   u_boil     wobble amount          u_grain   paper grain
-     *   u_ink      ink color
-     *   u_p        the current look's own three sliders
+     *   u_ink      ink color (for Neon edges, the neon tube color)
+     *   u_p        the current look's own four settings
      *   u_finOn    which finishes are on (x vignette, y matte, z glossy, w polaroid)
      *   u_finA/B   each finish's first and second slider, same order
      *   u_frameRot which edge of the picture is the viewer's bottom (0, 90, 180, 270),
-     *              so the polaroid's thick edge and the glossy shine land the right way up
+     *              so the polaroid's thick edge, the glossy shine, oil paint
+     *              highlights, and Old west creases are all lit from the viewer's top
+     *   u_time     seconds, for slow cycling (neon rainbow). The video's own clock when saving.
+     *   u_dmg      Old west damage layout number ("New damage" changes it)
+     *   u_paint    the oil paint image from the two oil passes (only used by Oil painting)
+     *   u_caption  the polaroid caption, drawn as handwriting into a small image;
+     *              u_capOn = 1 if there is one
      */
     const val DRAW_FS = PREC + """
-uniform sampler2D u_blur; uniform sampler2D u_src;
+uniform sampler2D u_blur; uniform sampler2D u_src; uniform sampler2D u_paint; uniform sampler2D u_caption;
 uniform vec2 u_res;
 uniform float u_seed, u_strength, u_thr, u_hatch, u_spacing, u_boil, u_grain, u_style;
 uniform vec3 u_ink;
-uniform vec3 u_p;
+uniform vec4 u_p;
 uniform vec4 u_finOn, u_finA, u_finB;
-uniform float u_frameRot;
+uniform float u_frameRot, u_time, u_dmg, u_capOn;
 varying vec2 v_uv;
 
 // ---- Helpers ---------------------------------------------------------------
@@ -211,14 +308,86 @@ vec3 hsv2rgb(float h, float s, float v){
   return v*mix(vec3(1.0), k, s);
 }
 
-// Heat camera colors: black, deep blue, purple, red, orange, yellow, white.
-vec3 thermal(float t){
+// Heat camera colors. t runs 0 (cold) to 1 (hot). pal picks the palette:
+//   0 Ironbow:   black, deep blue, purple, red, orange, yellow, white
+//   1 White-hot: black cold, white hot (how most real thermal scopes look)
+//   2 Black-hot: the reverse, white cold, black hot
+//   3 Rainbow:   blue cold through green and yellow to red, white at the very top
+vec3 thermal(float t, float pal){
+  if (pal > 2.5){
+    vec3 r = hsv2rgb(0.66*(1.0 - t), 1.0, 0.35 + 0.65*smoothstep(0.0, 0.25, t));
+    return mix(r, vec3(1.0), smoothstep(0.93, 1.0, t));
+  }
+  if (pal > 1.5) return vec3(1.0 - t)*vec3(0.97, 1.0, 0.97);
+  if (pal > 0.5) return vec3(t)*vec3(0.97, 1.0, 0.97);
   vec3 c = mix(vec3(0.0), vec3(0.10,0.0,0.45), smoothstep(0.0,0.2,t));
   c = mix(c, vec3(0.55,0.0,0.65), smoothstep(0.2,0.4,t));
   c = mix(c, vec3(0.95,0.10,0.10), smoothstep(0.4,0.6,t));
   c = mix(c, vec3(1.0,0.55,0.0), smoothstep(0.6,0.78,t));
   c = mix(c, vec3(1.0,0.95,0.2), smoothstep(0.78,0.92,t));
   return mix(c, vec3(1.0), smoothstep(0.92,1.0,t));
+}
+
+// Which way is UP for the person looking at the picture, in picture
+// coordinates. Everything that's "lit from above" uses this.
+vec2 upVec(){
+  if (u_frameRot < 45.0) return vec2(0.0, 1.0);
+  if (u_frameRot < 135.0) return vec2(-1.0, 0.0);
+  if (u_frameRot < 225.0) return vec2(0.0, -1.0);
+  return vec2(1.0, 0.0);
+}
+
+// ---- Old west damage helpers ----
+
+// One fold crease: a long line across the print through point p0 at angle
+// ang, wandering a little like a real fold. Returns the signed distance from
+// the crease (in 720 units), positive on the side toward the light.
+float creaseSide(vec2 px, vec2 p0, float ang, vec2 up){
+  vec2 dir = vec2(cos(ang), sin(ang));
+  vec2 nrm = vec2(-dir.y, dir.x);
+  if (dot(nrm, up) < 0.0) nrm = -nrm;               // point the normal toward the light
+  float along = dot(px - p0, dir);
+  return dot(px - p0, nrm) + (vnoise(vec2(along*0.02, ang*7.0)) - 0.5)*5.0;
+}
+
+// How a crease looks: a thin highlight on its upper edge (catching the
+// light from above) and a soft shadow just below it. Returns +bright / -dark.
+float creaseLight(float sd){
+  float hi = smoothstep(2.2, 0.4, sd)*step(0.0, sd);
+  float sh = smoothstep(6.0, 0.0, -sd)*step(sd, 0.0);
+  return 0.35*hi - 0.30*sh;
+}
+
+// Scratches on a print, at random angles. The print is cut into 180 unit
+// cells; some cells hold one scratch: a short nick, a long hairline, or a
+// long one with a slight curve. Looks at the 5 x 5 cells around this spot so
+// long scratches carry across cell lines. ds = damage layout, amt = how many.
+float printScratches(vec2 px, float ds, float amt){
+  float best = 0.0;
+  vec2 cell = floor(px/180.0);
+  for (int j = -2; j <= 2; j++){
+    for (int i = -2; i <= 2; i++){
+      vec2 c = cell + vec2(float(i), float(j));
+      float h1 = hash(c + ds*1.37);
+      if (h1 > 0.1 + 0.55*amt) continue;
+      float h2 = hash(c*1.7 + ds*2.11), h3 = hash(c*2.3 + ds*0.73), h4 = hash(c*3.1 + ds*1.91);
+      float kind = hash(c*4.7 + ds);
+      vec2 start = (c + vec2(h2, h3))*180.0;
+      float ang = h4*6.2832;
+      float len = kind < 0.5 ? mix(6.0, 24.0, h2) : mix(90.0, 380.0, h3);
+      float wdt = kind < 0.5 ? 1.4 : 0.6;
+      vec2 dir = vec2(cos(ang), sin(ang)), nrm = vec2(-dir.y, dir.x);
+      vec2 q = px - start;
+      float along = dot(q, dir);
+      float bend = kind > 0.8 ? (h1 - 0.05)*0.004*along*along : 0.0;   // the curved ones
+      float across = abs(dot(q, nrm) - bend);
+      float inside = step(0.0, along)*step(along, len);
+      float line = inside*(1.0 - smoothstep(wdt*0.5, wdt*1.6, across));
+      line *= 0.55 + 0.45*vnoise(vec2(along*0.05, h1*50.0));          // uneven, like a real scrape
+      best = max(best, line);
+    }
+  }
+  return best;
 }
 
 // One set of parallel pencil strokes at angle ang. Each stroke wanders a
@@ -270,38 +439,6 @@ vec2 cellCenter(vec2 px, float ang, float cell){
 vec3 toCmy(vec3 c, out float k){
   k = 1.0 - max(max(c.r, c.g), c.b);
   return (1.0 - c - k)/max(1.0 - k, 0.001);
-}
-
-// Oil paint (a Kuwahara filter). Look at the four squares that touch this
-// spot (up-left, up-right, down-left, down-right), each r units across,
-// and take the average color of whichever square is the most even. Flat
-// areas turn into smooth patches of paint while edges stay sharp, which is
-// what makes it read as brushwork instead of a blur. 3 x 3 samples per
-// square, spread out to 1.5 times r so each dab of paint is a decent size.
-vec3 kuwahara(vec2 p, float r){
-  vec3 m0 = vec3(0.0), m1 = vec3(0.0), m2 = vec3(0.0), m3 = vec3(0.0);
-  vec3 s0 = vec3(0.0), s1 = vec3(0.0), s2 = vec3(0.0), s3 = vec3(0.0);
-  for (int j = 0; j < 3; j++){
-    for (int i = 0; i < 3; i++){
-      vec2 o = vec2(float(i), float(j))*r*0.75;
-      vec3 c;
-      c = texture2D(u_src, (p + vec2(-o.x, -o.y))/u_res).rgb; m0 += c; s0 += c*c;
-      c = texture2D(u_src, (p + vec2( o.x, -o.y))/u_res).rgb; m1 += c; s1 += c*c;
-      c = texture2D(u_src, (p + vec2(-o.x,  o.y))/u_res).rgb; m2 += c; s2 += c*c;
-      c = texture2D(u_src, (p + vec2( o.x,  o.y))/u_res).rgb; m3 += c; s3 += c*c;
-    }
-  }
-  m0 /= 9.0; m1 /= 9.0; m2 /= 9.0; m3 /= 9.0;
-  // How uneven each square is (its variance, all three colors added up)
-  float v0 = dot(s0/9.0 - m0*m0, vec3(1.0));
-  float v1 = dot(s1/9.0 - m1*m1, vec3(1.0));
-  float v2 = dot(s2/9.0 - m2*m2, vec3(1.0));
-  float v3 = dot(s3/9.0 - m3*m3, vec3(1.0));
-  vec3 best = m0; float bv = v0;
-  if (v1 < bv){ bv = v1; best = m1; }
-  if (v2 < bv){ bv = v2; best = m2; }
-  if (v3 < bv){ bv = v3; best = m3; }
-  return best;
 }
 
 // The finishes need to know which way is up for the person looking at the
@@ -433,9 +570,10 @@ void main(){
     // ---- 5 Watercolor: soft washes that bleed past the edges ----
     // u_p: bleed, color strength, edge pooling.
     // Read the picture at spots pushed around by slow noise so the color
-    // runs a little outside the lines, then average a ring of 8 samples to
-    // soften it like wet paint.
-    vec2 bleed = (vec2(vnoise(px/28.0 + s*0.7), vnoise(px/28.0 + vec2(19.0, 7.0) + s*0.7)) - 0.5)*16.0*(0.1 + 1.2*u_p.x + 0.4*u_boil);
+    // runs outside the pencil lines, then average a ring of 8 samples to
+    // soften it like wet paint. The pencil underdrawing stays where it was,
+    // so the paint visibly slips past it.
+    vec2 bleed = (vec2(vnoise(px/28.0 + s*0.7), vnoise(px/28.0 + vec2(19.0, 7.0) + s*0.7)) - 0.5)*16.0*(0.25 + 1.4*u_p.x + 0.4*u_boil);
     vec2 wp = px + bleed;
     vec3 w = texture2D(u_src, wp/u_res).rgb;
     for (int i = 0; i < 8; i++){
@@ -446,9 +584,17 @@ void main(){
     w = mix(w, floor(w*5.0 + 0.5)/5.0, 0.45);       // layered washes: soft steps in color
     w = mix(vec3(lum(w)), w, 1.2);                  // a little more color
     w = mix(vec3(1.0), w, 0.4 + 0.6*u_p.y);         // see-through paint, the paper shows
-    float pool = smoothstep(0.004, 0.03, abs(diff));// paint pools darker where a wash ends
-    w *= 1.0 - 0.36*u_p.z*pool;
-    w *= 1.0 - u_grain*0.10*(1.0 - tooth);          // pigment settles into the paper grain
+    // Pooling: when a wash dries, the pigment gathers at its edge and dries
+    // darker there. Find the wash edges where the paint actually went (the
+    // bled position, not the original lines) and darken them in their own
+    // color, a bit like doubling up the paint.
+    vec3 wb = texture2D(u_blur, wp/u_res).rgb;
+    float pool = smoothstep(0.003, 0.025, abs(wb.r - wb.g));
+    w = mix(w, w*w*0.92, pool*u_p.z);
+    // Granulation: pigment settles into the low spots of the paper, more so
+    // in the darker, heavier washes
+    float heavy = 1.0 - lum(w);
+    w *= 1.0 - u_grain*(0.06 + 0.30*heavy)*(1.0 - tooth);
     col = paper*w;
     col = mix(col, u_ink, edge*0.35);               // light pencil underdrawing
   }
@@ -466,25 +612,44 @@ void main(){
   }
   else if (u_style < 7.5){
     // ---- 7 Oil painting ----
-    // u_p: brush size, color richness, canvas texture
-    vec3 oc = kuwahara(px + d*u_boil*3.0, u_p.x);
-    oc = mix(vec3(lum(oc)), oc, 1.0 + 0.6*u_p.y);   // richer color
-    oc = (oc - 0.5)*(1.0 + 0.15*u_p.y) + 0.5;
-    // Canvas weave plus brush hair streaks running at a slant
-    float weave = sin(px.x*1.9)*sin(px.y*1.9)*0.5 + 0.5;
-    vec2 bp = rot(px, 0.6)*vec2(0.08, 0.9);
-    float streak = vnoise(bp);
-    oc *= 1.0 - u_p.z*(0.10*weave + 0.12*streak);
-    // Thick paint ridges catch the light from above: brighter where the
-    // streak rises toward the top, darker where it falls away
-    float ridge = vnoise(bp + vec2(0.0, 0.06)) - streak;
-    oc += u_p.z*0.8*ridge;
+    // u_p: brush size, impasto depth, canvas.
+    // The paint itself was laid down by the two oil passes (OIL_GRAD_FS and
+    // OIL_PAINT_FS) at half size, with strokes that follow the shapes in
+    // the picture. u_paint holds that: color in rgb, and the stroke
+    // direction in alpha (0 to 1 = 0 to 180 degrees). Reading it here
+    // stretches it back up to full size.
+    vec4 pt = texture2D(u_paint, uv + d*u_boil*2.0/u_res);
+    vec3 oc = pt.rgb;
+    // A painter's limited palette: snap colors toward a few steps, then
+    // push the saturation so it reads as pigment, not a photo
+    oc = mix(oc, floor(oc*7.0 + 0.5)/7.0, 0.55);
+    oc = clamp(mix(vec3(lum(oc)), oc, 1.35), 0.0, 1.0);
+    // Impasto: the strokes are raised paint. Their height is the paint's
+    // brightness plus bristle ridges running along the stroke direction.
+    // Compare the height a little above and a little below this spot (as
+    // the viewer sees it): rising toward the light = highlight on top,
+    // falling away = shadow underneath.
+    float ang = pt.a*3.14159265;
+    vec2 td = vec2(cos(ang), sin(ang)), tn = vec2(-td.y, td.x);
+    vec2 up = upVec();
+    float e = 1.6;
+    vec2 pa = px + up*e, pb = px - up*e;
+    float ha = lum(texture2D(u_paint, pa/u_res).rgb)*0.75 + 0.25*vnoise(vec2(dot(pa, td)*0.04, dot(pa, tn)*0.3));
+    float hb = lum(texture2D(u_paint, pb/u_res).rgb)*0.75 + 0.25*vnoise(vec2(dot(pb, td)*0.04, dot(pb, tn)*0.3));
+    float slope = (ha - hb)*1.6;
+    oc += u_p.y*(0.55*max(slope, 0.0) - 0.45*max(-slope, 0.0));
+    // A subtle canvas weave under the paint, showing most where paint is thin
+    float weave = sin(px.x*2.3)*sin(px.y*2.3)*0.5 + 0.5;
+    float thread = vnoise(vec2(px.x*0.9, px.y*0.08))*0.5 + vnoise(vec2(px.x*0.08, px.y*0.9))*0.5;
+    oc *= 1.0 - u_p.z*(0.06*weave + 0.05*thread);
     col = oc;
   }
   else if (u_style < 8.5){
     // ---- 8 Neon edges: glowing tubes of light on black ----
-    // u_p: glow, hue, rainbow. The glow is the edge signal sampled in a
-    // ring around this spot, so light spills out from every line.
+    // u_p: glow, mode (0 Solid, 1 Rainbow, 2 Two-tone, 3 Scene color),
+    // rainbow speed. u_ink is the neon color picked on the Lines tab.
+    // The glow is the edge signal sampled in a ring around this spot, so
+    // light spills out from every line.
     float g = 0.0;
     float R = 3.0 + 9.0*u_p.x;
     for (int i = 0; i < 8; i++){
@@ -493,9 +658,27 @@ void main(){
       g += smoothstep(u_thr, u_thr*2.5 + 0.004, abs(bb.r - bb.g));
     }
     g = g/8.0*u_strength;
-    float hue = u_p.y + u_p.z*(0.35*uv.x + 0.25*uv.y + 0.15*vnoise(px/160.0 + s*0.05));
-    vec3 nc = hsv2rgb(fract(hue), 0.85, 1.0);
-    col = vec3(0.015, 0.015, 0.03) + nc*g*(0.6 + 1.8*u_p.x) + mix(nc, vec3(1.0), 0.55)*edgeAbs*1.4;
+    vec3 bg = vec3(0.015, 0.015, 0.03);
+    float glowAmt = 0.6 + 1.8*u_p.x;
+    vec3 nc;
+    if (u_p.y < 0.5) nc = u_ink;                                       // Solid: the picked color
+    else if (u_p.y < 1.5){                                             // Rainbow: hue sweeps across
+      float hue = 0.55*uv.x + 0.30*uv.y + 0.10*vnoise(px/160.0)        // the picture and slowly
+                + u_time*(0.02 + 0.25*u_p.z);                          // turns over time
+      nc = hsv2rgb(fract(hue), 0.85, 1.0);
+    }
+    else if (u_p.y < 2.5) nc = u_ink;                                  // Two-tone: see below
+    else {                                                             // Scene color: the real
+      float mx = max(max(src.r, src.g), src.b);                        // color, pushed to full
+      nc = src/max(mx, 0.08);                                          // brightness and saturated
+      nc = clamp(mix(vec3(lum(nc)), nc, 1.5), 0.0, 1.0);
+    }
+    if (u_p.y > 1.5 && u_p.y < 2.5){
+      // Two-tone: a white-hot core inside a colored glow, like a real tube
+      col = bg + nc*g*(glowAmt + 0.4) + vec3(1.0)*edgeAbs*1.5 + nc*edgeAbs*0.3;
+    } else {
+      col = bg + nc*g*glowAmt + mix(nc, vec3(1.0), 0.55)*edgeAbs*1.4;
+    }
   }
   else if (u_style < 9.5){
     // ---- 9 Crayon edges: thick waxy outlines and loose colored scribbles ----
@@ -520,23 +703,90 @@ void main(){
     col = mix(col, wax, clamp(ed, 0.0, 1.0)*cover);
   }
   else if (u_style < 10.5){
-    // ---- 10 Old west: a sepia tintype photograph ----
-    // u_p: sepia, scratches and dust, plate wear
+    // ---- 10 Old west: an old sepia photograph that's been through a lot ----
+    // u_p: sepia, scratches, wear, damage mode (0 Print, 1 Film).
+    // u_dmg picks the damage layout; "New damage" in the Style tab changes
+    // it. In Print mode everything stays put, like damage on a real print.
+    // In Film mode vertical scratches and dust flicker frame to frame like
+    // an old reel going through a projector.
+    float wear = u_p.z;
+    float ds = u_dmg;
+    vec2 up = upVec();
+    float mid = smoothstep(0.30, 0.45, wear);       // folds and corner wear start here
+    float high = smoothstep(0.65, 0.80, wear);      // cross folds, cracks, chips, dog-ears
+
     float l = mix(lum(src), b.r, 0.3);              // a little soft, like an old lens
     l = clamp((l - 0.5)*1.35 + 0.52, 0.0, 1.0);
-    float blot = vnoise(px/140.0 + vec2(3.1, 7.7)); // uneven chemistry across the plate
-    l *= 1.0 - u_p.z*0.4*smoothstep(0.55, 0.9, blot);
-    l *= 1.0 - u_p.z*0.6*smoothstep(0.3, 0.75, length(uv - 0.5));   // darker toward the edges
-    // Scratches and dust move every wobble step, like an old film reel
-    float sx = px.x + (vnoise(vec2(px.y*0.01, s)) - 0.5)*30.0;
-    float scratch = step(0.996, hash(vec2(floor(sx/1.5), floor(s)))) * step(0.3, vnoise(vec2(sx*0.01, px.y*0.02 + s)));
-    float dust = step(0.9985, hash(floor(px/1.8) + s*7.0));
-    l = mix(l, 0.95, u_p.y*scratch*0.8);
-    l = mix(l, 0.05, u_p.y*dust);
+    l = mix(l, 0.62 + (l - 0.5)*0.55, wear*0.6);    // fading: blacks lift, contrast flattens
+    float blot = vnoise(px/140.0 + vec2(3.1, 7.7) + ds);
+    l *= 1.0 - 0.25*wear*smoothstep(0.55, 0.9, blot);                 // uneven chemistry
+    l *= 1.0 - 0.45*wear*smoothstep(0.35, 0.8, length(uv - 0.5));     // darker toward the edges
+
+    if (u_p.w < 0.5){
+      // Print: scratches at random angles, fixed in place
+      float sc = printScratches(px, ds, u_p.y);
+      l = mix(l, 0.96, sc*0.85);
+      l = mix(l, 0.06, u_p.y*step(0.9988, hash(floor(px/1.8) + ds*7.0)));     // specks of dust
+    } else {
+      // Film: new vertical scratches and dust about 18 times a second
+      float fr = s + floor(u_time*18.0);
+      float sx = px.x + (vnoise(vec2(px.y*0.01, fr)) - 0.5)*30.0;
+      float scratch = step(0.997 - 0.003*u_p.y, hash(vec2(floor(sx/1.5), fr))) * step(0.3, vnoise(vec2(sx*0.01, px.y*0.02 + fr)));
+      float dust = step(0.9985, hash(floor(px/1.8) + fr*7.0));
+      l = mix(l, 0.95, scratch*0.8*min(1.0, u_p.y*2.0));
+      l = mix(l, 0.05, u_p.y*dust);
+    }
+
     vec3 darkT = vec3(0.10, 0.08, 0.06), midT = vec3(0.47, 0.38, 0.27), lightT = vec3(0.93, 0.87, 0.75);
     vec3 tinted = l < 0.5 ? mix(darkT, midT, l*2.0) : mix(midT, lightT, (l - 0.5)*2.0);
     col = mix(vec3(l), tinted, u_p.x);
     col *= 1.0 - u_grain*0.06*tooth;
+
+    // Age spots ("foxing"): brown freckles that creep in as the print ages
+    float fox = smoothstep(0.80, 0.86, vnoise(px*0.035 + ds*13.0)) + 0.6*step(0.93, vnoise(px*0.16 + ds*5.0));
+    col = mix(col, col*vec3(0.78, 0.62, 0.42), clamp(fox, 0.0, 1.0)*smoothstep(0.15, 0.9, wear)*0.8);
+
+    vec3 paperBack = vec3(0.90, 0.86, 0.76);        // bare paper where the picture layer is gone
+    if (mid > 0.0){
+      // One fold crease, roughly across or down the middle
+      vec2 c1 = u_res*(0.5 + (vec2(hash(vec2(ds, 1.0)), hash(vec2(ds, 2.0))) - 0.5)*0.4);
+      float a1 = (hash(vec2(ds, 3.0)) > 0.5 ? 0.0 : 1.5708) + (hash(vec2(ds, 4.0)) - 0.5)*0.35;
+      float sd1 = creaseSide(px, c1, a1, up);
+      col += creaseLight(sd1)*mid;
+      float nearCrease = abs(sd1);
+      if (high > 0.0){
+        // A second fold crossing the first
+        float a2 = a1 + 1.5708 + (hash(vec2(ds, 5.0)) - 0.5)*0.3;
+        vec2 c2 = u_res*(0.5 + (vec2(hash(vec2(ds, 6.0)), hash(vec2(ds, 7.0))) - 0.5)*0.4);
+        float sd2 = creaseSide(px, c2, a2, up);
+        col += creaseLight(sd2)*high;
+        nearCrease = min(nearCrease, abs(sd2));
+        // Cracked picture layer along the creases: a web of fine cracks
+        // and flakes that have fallen off, showing bare paper underneath
+        float near = smoothstep(22.0, 4.0, nearCrease)*high;
+        float crack = 1.0 - smoothstep(0.0, 0.05, abs(vnoise(px*0.09 + ds) - 0.5));
+        float flake = smoothstep(0.62, 0.70, vnoise(px*0.06 + ds*3.0));
+        col = mix(col, paperBack, near*clamp(crack*0.8 + flake, 0.0, 1.0));
+      }
+      // Corner wear: the corners get rubbed pale from handling
+      float corner = smoothstep(55.0, 8.0, length(min(px, u_res - px)));
+      col = mix(col, paperBack, clamp(corner*(0.6 + 0.4*vnoise(px*0.2 + ds))*mid, 0.0, 1.0)*0.85);
+    }
+    if (high > 0.0){
+      // A dog-eared corner: one corner folded over, showing the cream back
+      // of the print, with a shadow just past the fold line
+      float ci = floor(hash(vec2(ds, 9.0))*4.0);
+      vec2 cpx = vec2(mod(ci, 2.0), floor(ci/2.0))*u_res;
+      vec2 lc = abs(px - cpx);
+      float t = lc.x + lc.y;
+      float sz = (50.0 + 70.0*hash(vec2(ds, 10.0)))*high;
+      if (t < sz) col = paperBack*(0.80 + 0.14*(t/sz));
+      else col *= 1.0 - 0.30*smoothstep(8.0, 0.0, t - sz);
+      // Chipped edges: bites out of the border showing the dark table underneath
+      float edgeD = min(min(px.x, px.y), min(u_res.x - px.x, u_res.y - px.y));
+      float chip = (3.0 + 16.0*smoothstep(0.55, 0.9, vnoise(vec2((px.x + px.y)*0.04, ds))))*high;
+      col = mix(col, vec3(0.11, 0.10, 0.09), 1.0 - smoothstep(chip - 1.0, chip + 1.0, edgeD));
+    }
   }
   else if (u_style < 11.5){
     // ---- 11 Inverted: a color negative ----
@@ -548,11 +798,11 @@ void main(){
   }
   else {
     // ---- 12 Predator vision: a fake heat camera ----
-    // u_p: edge heat, contrast, scan lines. Bright spots read hot and so
-    // do busy edges. No real temperature involved, it just looks the part.
+    // u_p: edge heat, contrast, scan lines, palette. Bright spots read hot
+    // and so do busy edges. No real temperature involved, it just looks the part.
     float heat = (b.r - 0.5)*(0.8 + 1.8*u_p.y) + 0.5 + edgeAbs*u_p.x*0.6;
     heat += (vnoise(px/90.0 + s*0.4) - 0.5)*0.05;   // a slight shimmer
-    col = thermal(clamp(heat, 0.0, 1.0));
+    col = thermal(clamp(heat, 0.0, 1.0), u_p.w);
     col *= 1.0 - u_p.z*0.3*(0.5 + 0.5*sin(px.y*2.2));
   }
 
@@ -591,6 +841,24 @@ void main(){
     vec2 bq = q*vres;
     float t = vnoise(bq*0.8)*0.5 + vnoise(bq*0.25)*0.5;
     col = (vec3(0.95, 0.94, 0.90) - 0.025*t*(0.5 + u_grain))*(0.97 + 0.04*q.y);
+    if (u_capOn > 0.5){
+      // The caption, written on the thick bottom border like you'd do with
+      // a pen. u_caption is a 1024 x 192 image of the handwriting, made by
+      // the app whenever the caption changes. Center it on the bottom
+      // border, about 60% of the border's height, shrunk if it's too wide.
+      float side = mix(14.0, 46.0, u_finA.w);
+      float bottomH = side*3.2;
+      float boxH = bottomH*0.62;
+      float boxW = boxH*(1024.0/192.0);
+      float maxW = vres.x - side*2.0 - 8.0;
+      if (boxW > maxW){ boxH *= maxW/boxW; boxW = maxW; }
+      vec2 o = vec2((vres.x - boxW)*0.5, (bottomH - boxH)*0.5);
+      vec2 cuv = (bq - o)/vec2(boxW, boxH);
+      if (cuv.x >= 0.0 && cuv.x <= 1.0 && cuv.y >= 0.0 && cuv.y <= 1.0){
+        vec4 ct = texture2D(u_caption, vec2(cuv.x, 1.0 - cuv.y));   // the image's top row is its top
+        col = col*(1.0 - ct.a) + ct.rgb;                            // ink over the card
+      }
+    }
   }
   if (u_finOn.z > 0.5){
     // Glossy, part two: the shine. A soft glow toward the top and one

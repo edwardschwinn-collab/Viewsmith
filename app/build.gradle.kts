@@ -21,8 +21,8 @@ android {
         applicationId = "com.pencilcam.app"
         minSdk = 29          // Android 10 and up. Keeps saving to the gallery simple.
         targetSdk = 35
-        versionCode = 5      // Goes up by one for every build I install over the top
-        versionName = "0.5"  // What the Settings menu shows
+        versionCode = 6      // Goes up by one for every build I install over the top
+        versionName = "0.6"  // What the Settings menu shows
     }
 
     // ------------------------------------------------------------------------
