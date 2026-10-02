@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Back layer of the app icon: the dark tile from design/viewsmith-icon.svg,
+     lighter at the top and darker at the bottom (light from above). -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <gradient android:angle="270" android:startColor="#2A2E34" android:endColor="#08090B" />
+</shape>

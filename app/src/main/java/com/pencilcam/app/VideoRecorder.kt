@@ -15,30 +15,37 @@ import java.util.Locale
 
 /**
  * ============================================================================
- * VideoRecorder
- * Wraps Android's MediaRecorder. We DRAW into its input Surface with OpenGL
- * (the sketch), and it handles the hard parts: H.264 video, AAC microphone
- * audio, and writing the MP4 into Movies/PencilCam in your gallery.
+ * VideoRecorder (Video mode)
+ * Records the live sketch to an MP4 in Movies/ViewSmith.
+ *
+ * Android's MediaRecorder does the heavy lifting: H.264 video, AAC sound
+ * from the microphone, and writing the file. Normally it would film the
+ * camera directly. Here it's set to take its picture from a Surface
+ * instead, and the renderer draws the finished sketch into that Surface,
+ * so what gets recorded is the drawing, not the raw camera.
  * ============================================================================
  */
 class VideoRecorder(private val ctx: Context) {
+    /** The renderer draws into this while recording. */
     var surface: Surface? = null; private set
     private var mr: MediaRecorder? = null
     private var pfd: ParcelFileDescriptor? = null
     private var uri: Uri? = null
 
     /**
-     * @param w,h      video size in pixels (must match what the GPU draws)
-     * @param rotation degrees clockwise the player should turn it (how you held the phone)
+     * Get everything ready, but don't start yet.
+     * @param w,h      video size in pixels (has to match what the renderer draws)
+     * @param rotation degrees clockwise a player should turn it (how the phone was held)
      * @param audio    record the microphone too?
      */
     fun prepare(w: Int, h: Int, rotation: Int, audio: Boolean): Boolean {
         return try {
-            val name = "PencilCam_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4"
+            // Make the gallery entry first. IS_PENDING keeps it hidden until it's finished.
+            val name = "ViewSmith_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4"
             val values = ContentValues().apply {
                 put(MediaStore.Video.Media.DISPLAY_NAME, name)
                 put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/PencilCam")
+                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/ViewSmith")
                 put(MediaStore.Video.Media.IS_PENDING, 1)
             }
             uri = ctx.contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: return false
@@ -46,7 +53,8 @@ class VideoRecorder(private val ctx: Context) {
 
             @Suppress("DEPRECATION")
             val r = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(ctx) else MediaRecorder()
-            // ORDER MATTERS with MediaRecorder: sources, then format, then encoders/settings
+            // MediaRecorder is fussy about order: sources first, then the
+            // file format, then encoders and their settings.
             if (audio) r.setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
             r.setVideoSource(MediaRecorder.VideoSource.SURFACE)
             r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
@@ -66,16 +74,17 @@ class VideoRecorder(private val ctx: Context) {
             surface = r.surface
             true
         } catch (e: Exception) {
-            Log.e("PencilCam", "Recorder prepare failed", e); abandon(); false
+            Log.e("ViewSmith", "Recorder prepare failed", e); abandon(); false
         }
     }
 
     fun start() { mr?.start() }
 
-    /** Stops and finalizes the file. Returns true if a video was saved. */
+    /** Stop and finish the file. Returns true if a video was saved. */
     fun stop(): Boolean {
         var ok = false
-        try { mr?.stop(); ok = true } catch (e: Exception) { Log.w("PencilCam", "stop failed (too short?)", e) }
+        // stop() throws if almost nothing was recorded (a tap-tap). Then there's no file to keep.
+        try { mr?.stop(); ok = true } catch (e: Exception) { Log.w("ViewSmith", "stop failed (too short?)", e) }
         mr?.release(); mr = null; surface = null
         try { pfd?.close() } catch (_: Exception) {}
         uri?.let { u ->
@@ -87,7 +96,7 @@ class VideoRecorder(private val ctx: Context) {
         return ok
     }
 
-    /** Throw away a recording that never started. */
+    /** Throw away a recording that never got going. */
     fun abandon() {
         try { mr?.release() } catch (_: Exception) {}
         mr = null; surface = null

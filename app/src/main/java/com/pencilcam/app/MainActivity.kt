@@ -23,6 +23,7 @@ import android.provider.MediaStore
 import android.util.Size
 import android.view.Gravity
 import android.view.OrientationEventListener
+import android.view.Surface
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -58,30 +59,44 @@ import kotlin.math.roundToInt
 
 /**
  * ============================================================================
- * MainActivity (v0.3)
- * v0.3 adds: slide-out panels that turn with the phone, a Settings cog that
- * always sits at YOUR bottom-left corner, menu see-through (opacity) control,
- * and Exit. Every icon now spins on its own glass, so the shine stays on top.
+ * MainActivity: the one and only screen in ViewSmith.
  *
- * The screen is built in code so it can re-arrange when you turn the phone:
- *   PORTRAIT  : drawing on top (4:3), black-glass control deck below
- *   LANDSCAPE : drawing fills the screen (16:9), dial floats over it
- * The app itself stays locked to portrait (like most camera apps) and uses
- * the accelerometer to know how you're holding it, so the camera never
- * restarts mid-shot and icons simply rotate to stay upright.
+ * ViewSmith takes the live camera, a photo, or a video and redraws it as a
+ * hand-drawn picture: pencil, ink pen, colored pencil, comic, halftone,
+ * watercolor, or chalkboard. Lines can wobble a little from frame to frame
+ * the way hand-drawn animation does.
+ *
+ * The dial at the bottom picks the mode:
+ *   PHOTO : live camera, tap to save a still drawing
+ *   VIDEO : live camera, tap to start and stop recording the drawing
+ *   FILE  : pick a photo or video from the gallery, tap to save it drawn
+ *
+ * How the screen is laid out:
+ *   Holding it upright  : drawing on top (4:3), black glass control deck below
+ *   Holding it sideways : drawing fills the screen (16:9), dial floats over it
+ *
+ * The screen itself is locked to portrait, like most camera apps. Instead
+ * of letting Android rotate everything (which would restart the camera
+ * mid-shot), I read the phone's tilt sensor and turn the icons, menus, and
+ * settings cog myself so they always read right side up. Because of that,
+ * every position below is worked out in the phone's PORTRAIT pixel grid,
+ * even when you're holding it sideways.
+ *
+ * The screen is built in code rather than in an XML layout file, since it
+ * rearranges itself so much.
  * ============================================================================
  */
 class MainActivity : AppCompatActivity() {
 
-    // ---- Modes (match the dial)
+    // ---- Which mode the dial is on
     private var mode = ModeDial.PHOTO
 
     // ---- Views
     private lateinit var root: FrameLayout
-    private lateinit var videoBox: FrameLayout
+    private lateinit var videoBox: FrameLayout           // the drawing area: GPU view, tabs, panel
     private lateinit var glView: GLSurfaceView
     private lateinit var renderer: SketchRenderer
-    private lateinit var deck: FrameLayout
+    private lateinit var deck: FrameLayout               // control deck: dial, flip button, mode label
     private lateinit var dial: ModeDial
     private lateinit var flipBtn: GlossButton
     private lateinit var modeLabel: TextView
@@ -90,52 +105,63 @@ class MainActivity : AppCompatActivity() {
     private lateinit var panel: MaxHeightScrollView      // the slide-out slider panel
     private lateinit var panelContent: LinearLayout
     private lateinit var panelBg: GlossPanelDrawable
-    private lateinit var cogBtn: GlossButton             // settings gear, bottom-left from the user's view
+    private lateinit var cogBtn: GlossButton             // settings gear, always at your bottom-left
     private lateinit var settingsPanel: MaxHeightScrollView
     private lateinit var settingsContent: LinearLayout
     private lateinit var settingsBg: GlossPanelDrawable
     private var settingsOpen = false
-    private var cogCorner = -1                           // which corner the cog is parked in (= deviceRot)
+    private var cogCorner = -1                           // which corner the cog is parked in (same as deviceRot)
     private val tabs = LinkedHashMap<String, GlossTab>()
     private var openTab: String? = null
 
     // ---- State
     private lateinit var settings: SketchSettings
+    // The settings file keeps its old name so nobody's saved look is lost (see SketchSettings)
     private val prefs by lazy { getSharedPreferences("pencilcam", MODE_PRIVATE) }
     private var useFront = false
     private var deviceRot = 0              // 0, 90, 180, 270: how the phone is being held
     private var pendingRot = 0
     private var landscapeHeld = false
-    private var loadedBitmap: Bitmap? = null
     private var recorder: VideoRecorder? = null
     private var recording = false
     private var recStart = 0L
     private val handler = Handler(Looper.getMainLooper())
     private var lastW = 0; private var lastH = 0
 
-    // ---- App settings (the cog menu). Saved in the same prefs file.
-    private var uiOpacity = 0.35f       // menu background, 0f clear .. 1f solid
-    private var haptics = true          // dial clicks
-    private var keepAwake = true        // screen stays on while PencilCam is open
-    private var rememberLook = true     // reload your sliders and style on launch
+    // ---- File mode: what's loaded (a photo OR a video, never both)
+    private var loadedBitmap: Bitmap? = null
+    private var videoUri: Uri? = null
+    private var videoInfo: VideoInfo? = null
+    private var videoSurface: Surface? = null            // the renderer's input for the video decoder
+    private var player: VideoPlayer? = null              // loops the video on screen
+    private var exporter: VideoExporter? = null          // saving a sketched copy, when running
+    private val exporting get() = exporter != null
+    private fun fileLoaded() = loadedBitmap != null || videoUri != null
 
-    // ---- Permission + picker launchers
+    // ---- App settings (the cog menu), saved in the same prefs file
+    private var uiOpacity = 0.35f       // menu background, 0 = clear, 1 = solid
+    private var haptics = true          // dial clicks
+    private var keepAwake = true        // screen stays on while the app is open
+    private var rememberLook = true     // reload the sliders and style on launch
+
+    // ---- Permission requests and the gallery picker.
+    // Android shows its own pop-up for these and calls back with the answer.
     private val askCamera = registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
-        if (ok) startCamera() else toast("PencilCam needs the camera. Allow it in Settings > Apps > PencilCam.")
+        if (ok) startCamera() else toast("ViewSmith needs the camera. Allow it in Settings > Apps > ViewSmith.")
     }
     private val askMic = registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         if (!ok) toast("No microphone: videos will record without sound.")
     }
-    private val pickImage = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-        if (uri != null) loadImage(uri) else if (loadedBitmap == null) updateModeLabel()
+    private val pickMedia = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri != null) loadPicked(uri) else if (!fileLoaded()) updateModeLabel()
     }
 
     // ========================================================================
-    // Setup
+    // Start up
     // ========================================================================
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Full-screen camera look: hide status and navigation bars (swipe to peek)
+        // Full screen: hide the status bar and navigation bar (swipe in from an edge to see them)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowInsetsControllerCompat(window, window.decorView).apply {
             hide(WindowInsetsCompat.Type.systemBars())
@@ -143,13 +169,13 @@ class MainActivity : AppCompatActivity() {
         }
         loadUiPrefs()
         val saved = SketchSettings.load(prefs)
-        // "Remember my look" off = start from defaults, but keep the camera-rotation fix
+        // With "Remember my look" off, start from the defaults, but keep the camera rotation fix
         settings = if (rememberLook) saved else SketchSettings(rotationFix = saved.rotationFix)
         buildScreen()
         applyUiPrefs()
         setMode(ModeDial.PHOTO, fromDial = false)
 
-        // Back gesture closes an open menu first, then works normally
+        // The back gesture closes an open menu first. With nothing open, it works normally.
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 when {
@@ -164,6 +190,11 @@ class MainActivity : AppCompatActivity() {
         else askCamera.launch(Manifest.permission.CAMERA)
     }
 
+    /**
+     * Watches the tilt sensor. It reports 0 to 359 degrees; I snap that to
+     * the nearest quarter turn, then wait 350 ms for it to settle so the
+     * screen doesn't flicker while the phone is on its way around.
+     */
     private val orientationListener by lazy {
         object : OrientationEventListener(this) {
             override fun onOrientationChanged(o: Int) {
@@ -172,24 +203,24 @@ class MainActivity : AppCompatActivity() {
                 if (snapped != pendingRot) {
                     pendingRot = snapped
                     handler.removeCallbacks(applyRotation)
-                    handler.postDelayed(applyRotation, 350)   // wait until it's steady
+                    handler.postDelayed(applyRotation, 350)
                 }
             }
         }
     }
     private val applyRotation = Runnable {
-        if (recording) return@Runnable                       // keep everything fixed while filming
+        if (recording || exporting) return@Runnable          // keep everything still while filming or saving
         deviceRot = pendingRot
         val land = deviceRot == 90 || deviceRot == 270
         if (land != landscapeHeld) {
             landscapeHeld = land
             applyLayout(force = true)
-            if (!(mode == ModeDial.FILE && loadedBitmap != null)) startCamera()   // switch 4:3 <-> 16:9
+            if (!(mode == ModeDial.FILE && fileLoaded())) startCamera()   // switch between 4:3 and 16:9
         }
         rotateIcons()
         placePanels()
         placeCog(animated = true)
-        // Open menus jump to their new angle, so fade them back in instead of popping
+        // Open menus jump to their new angle, so fade them back in instead of letting them pop
         for (v in listOf(panel, settingsPanel)) if (v.visibility == View.VISIBLE) {
             v.alpha = 0f; v.animate().alpha(1f).setDuration(200).start()
         }
@@ -198,10 +229,13 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume(); glView.onResume()
         if (orientationListener.canDetectOrientation()) orientationListener.enable()
+        if (mode == ModeDial.FILE && videoSurface != null) startPlayer()
     }
     override fun onPause() {
         orientationListener.disable()
         if (recording) stopRecording(fromPause = true)
+        exporter?.cancel()                                   // leaving the app stops a video save
+        stopPlayer()
         glView.onPause(); super.onPause()
     }
 
@@ -212,7 +246,7 @@ class MainActivity : AppCompatActivity() {
         root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         setContentView(root)
 
-        // --- Drawing area (GPU view + side tabs + slide-out panel)
+        // --- Drawing area (GPU view, side tabs, slide-out panel)
         videoBox = FrameLayout(this)
         root.addView(videoBox, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
@@ -224,9 +258,10 @@ class MainActivity : AppCompatActivity() {
         renderer = SketchRenderer(glView)
         renderer.settings = settings.copy()
         renderer.onNeedCamera = { startCamera() }
+        renderer.onNeedVideo = { reopenVideo() }
         renderer.onRecordError = { msg -> toast(msg); stopRecording(failed = true) }
         glView.setRenderer(renderer)
-        glView.renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
+        glView.renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY     // only redraw when something changes
         videoBox.addView(glView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
         tabsCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -238,10 +273,10 @@ class MainActivity : AppCompatActivity() {
         videoBox.addView(tabsCol, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.END or Gravity.CENTER_VERTICAL).apply { marginEnd = dp(8) })
 
-        // The panel lives inside panelHost: an invisible box sitting right beside the tabs.
-        // The panel is centered in that box and ROTATED to face the user, so it reads
-        // upright whether the phone is portrait, landscape, or upside down.
-        // (Android rotates touches too, so sliders drag the right way when it's turned.)
+        // The slider panel sits inside panelHost, an invisible box right beside
+        // the tabs. The panel is centered in that box and turned to face you,
+        // so it reads upright whichever way the phone is held. Android turns
+        // touches along with it, so the sliders still drag the right way.
         panelHost = FrameLayout(this).apply { clipChildren = false; clipToPadding = false }
         videoBox.addView(panelHost, FrameLayout.LayoutParams(0, 0, Gravity.TOP or Gravity.LEFT))
         panelBg = GlossPanelDrawable(dp(18).toFloat())
@@ -251,7 +286,7 @@ class MainActivity : AppCompatActivity() {
         panelContent = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(12), dp(16), dp(14)) }
         panel.addView(panelContent)
         panelHost.addView(panel, FrameLayout.LayoutParams(dp(290), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
-        panel.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> hugTabs() }   // re-snug when its size changes
+        panel.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> hugTabs() }   // stay snug to the tabs when its size changes
 
         // --- Control deck (dial, flip button, mode label)
         deck = FrameLayout(this)
@@ -260,7 +295,7 @@ class MainActivity : AppCompatActivity() {
         dial = ModeDial(this).apply {
             onModeChanged = { m -> setMode(m, fromDial = true) }
             onShutter = { shutter() }
-            onLongPress = { if (mode == ModeDial.FILE) openPicker() }
+            onLongPress = { if (mode == ModeDial.FILE && !exporting) openPicker() }
             contentDescription = "Shutter. Drag the ring to change mode."
         }
         deck.addView(dial, FrameLayout.LayoutParams(dp(164), dp(164), Gravity.CENTER))
@@ -279,7 +314,7 @@ class MainActivity : AppCompatActivity() {
         deck.addView(modeLabel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.BOTTOM).apply { bottomMargin = dp(10) })
 
-        // --- Settings cog: always at the bottom-left corner as YOU see the screen
+        // --- Settings cog: always in the bottom-left corner as YOU see the screen
         cogBtn = GlossButton(this, GlossButton.COG).apply {
             contentDescription = "Settings"
             setOnClickListener { toggleSettings() }
@@ -287,7 +322,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(cogBtn, FrameLayout.LayoutParams(dp(50), dp(50), Gravity.BOTTOM or Gravity.LEFT))
         placeCog(animated = false)
 
-        // --- Settings panel: centered on the screen, rotated to face the user
+        // --- Settings panel: centered on the screen, turned to face you
         settingsBg = GlossPanelDrawable(dp(20).toFloat())
         settingsPanel = MaxHeightScrollView(this).apply {
             background = settingsBg; visibility = View.GONE; isVerticalScrollBarEnabled = false
@@ -299,7 +334,7 @@ class MainActivity : AppCompatActivity() {
         root.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applyLayout(force = false) }
     }
 
-    /** Arrange the drawing area and deck for portrait or landscape holding. */
+    /** Lay out the drawing area and the deck for holding the phone upright or sideways. */
     private fun applyLayout(force: Boolean) {
         val W = root.width; val H = root.height
         if (W == 0 || H == 0) return
@@ -309,13 +344,13 @@ class MainActivity : AppCompatActivity() {
         val vb = videoBox.layoutParams as FrameLayout.LayoutParams
         val dk = deck.layoutParams as FrameLayout.LayoutParams
         if (!landscapeHeld) {
-            // Drawing on top at 4:3 (portrait 3 wide x 4 tall), deck fills the rest
+            // Drawing on top at 4:3 (3 wide by 4 tall), the deck takes what's left below
             val videoH = min(W * 4 / 3, H - dp(200))
             vb.width = W; vb.height = videoH; vb.gravity = Gravity.TOP
             dk.height = H - videoH
             deck.background = deckBackground(H - videoH)
         } else {
-            // Full-screen drawing, deck floats over the bottom
+            // Drawing fills the screen, the deck floats over the bottom on a soft dark fade
             vb.width = W; vb.height = H; vb.gravity = Gravity.TOP
             dk.height = dp(230)
             deck.background = GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP,
@@ -326,11 +361,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Size, position, and turn both menus for how the phone is held.
-     * Everything here is in the phone's PORTRAIT pixel grid (the app never actually
-     * rotates), so in landscape the panel's "width as you see it" runs up and down
-     * the portrait screen. The tabs always hug the portrait right edge, which is
-     * your bottom edge (held left-side up) or top edge (right-side up).
+     * Size, place, and turn both menus for how the phone is held.
+     * Remember, everything here is in the PORTRAIT pixel grid. Held sideways,
+     * the panel's "width as you see it" actually runs up and down the
+     * portrait screen. The tabs always hug the portrait right edge, which is
+     * your bottom edge (left side up) or top edge (right side up).
      */
     private fun placePanels() {
         val W = root.width; val H = root.height
@@ -341,19 +376,19 @@ class MainActivity : AppCompatActivity() {
         val host = panelHost.layoutParams as FrameLayout.LayoutParams
         val pl = panel.layoutParams as FrameLayout.LayoutParams
         if (!landscapeHeld) {
-            // Portrait: same spot as v0.2, a 290dp column just left of the tabs
+            // Upright: a 290dp column just left of the tabs
             host.leftMargin = W - dp(76) - dp(290); host.topMargin = dp(20)
             host.width = dp(290); host.height = (vbH - dp(40)).coerceAtLeast(dp(200))
             pl.width = dp(290)
             panel.maxHeight = host.height
         } else {
-            // Landscape: a band beside the tabs, centered along them.
-            // span = panel width as you see it; it stays clear of the dial deck.
+            // Sideways: a band beside the tabs, centered along them.
+            // span = the panel's width as you see it, kept clear of the dial.
             val span = min(dp(380), H - dp(470)).coerceAtLeast(dp(240))
             host.leftMargin = dp(16); host.topMargin = (vbH - span) / 2
             host.width = W - dp(76) - dp(16); host.height = span
             pl.width = span
-            panel.maxHeight = host.width          // panel height as you see it = the short side of the screen
+            panel.maxHeight = host.width          // its height as you see it = the short side of the screen
         }
         panelHost.layoutParams = host; panel.layoutParams = pl
         panel.rotation = turn
@@ -369,19 +404,19 @@ class MainActivity : AppCompatActivity() {
         hugTabs()
     }
 
-    /** In landscape, slide the panel over so its edge sits right against the tab row. */
+    /** Held sideways, slide the panel over so its edge sits right against the tabs. */
     private fun hugTabs() {
         panel.translationX = if (landscapeHeld && panel.height > 0) (panelHost.width - panel.height) / 2f else 0f
     }
 
-    /** Park the cog in the corner that is bottom-left from the user's point of view. */
+    /** Park the cog in whichever corner is bottom-left from where you're looking. */
     private fun placeCog(animated: Boolean) {
         if (deviceRot == cogCorner) return
         val first = cogCorner == -1
         cogCorner = deviceRot
         val move = {
             val lp = cogBtn.layoutParams as FrameLayout.LayoutParams
-            // deviceRot 90 = left side up, so your bottom-left is the phone's bottom-right, and so on
+            // deviceRot 90 = left side up, so your bottom-left is the phone's bottom-right, and so on around
             lp.gravity = when (cogCorner) {
                 90 -> Gravity.BOTTOM or Gravity.RIGHT
                 180 -> Gravity.TOP or Gravity.RIGHT
@@ -393,14 +428,14 @@ class MainActivity : AppCompatActivity() {
             cogBtn.iconRotation = -cogCorner.toFloat()
         }
         if (!animated || first) { move(); return }
-        // Fade out, hop corners, fade back in
+        // Fade out, hop to the new corner, fade back in
         cogBtn.animate().cancel()
         cogBtn.animate().alpha(0f).setDuration(110).withEndAction {
             move(); cogBtn.animate().alpha(1f).setDuration(170).start()
         }.start()
     }
 
-    /** Black-glass deck with a silver hairline at the top edge. */
+    /** Black glass deck with a thin silver line along the top edge. */
     private fun deckBackground(h: Int): android.graphics.drawable.Drawable {
         val sd = ShapeDrawable(RectShape())
         sd.paint.shader = LinearGradient(0f, 0f, 0f, h.toFloat(),
@@ -409,10 +444,10 @@ class MainActivity : AppCompatActivity() {
         return sd
     }
 
-    /** Turn icons so they read upright however the phone is held. */
+    /** Turn the icons so they read upright however the phone is held. */
     private fun rotateIcons() {
         val target = -deviceRot.toFloat()
-        // Animate an icon the short way round. Only the icon turns; the glass and shine stay lit from above.
+        // Spin each icon the short way round. Only the icon turns; the glass and shine stay lit from above.
         fun spin(get: () -> Float, set: (Float) -> Unit) {
             val from = get()
             var d = (target - from) % 360f
@@ -432,59 +467,68 @@ class MainActivity : AppCompatActivity() {
     // Modes and the shutter
     // ========================================================================
     private fun setMode(m: Int, fromDial: Boolean) {
-        if (recording) { dial.setMode(mode); return }
+        if (recording || exporting) { dial.setMode(mode); return }    // no switching mid-recording or mid-save
         val old = mode
         mode = m
         if (!fromDial) dial.setMode(m)
-        renderer.animate = m != ModeDial.PHOTO                 // Photo: the drawing holds still
+        renderer.animate = m != ModeDial.PHOTO                 // in Photo mode the drawing holds still
         tabs["Motion"]?.visibility = if (m == ModeDial.PHOTO) View.GONE else View.VISIBLE
         if (m == ModeDial.PHOTO && openTab == "Motion") closePanel()
         flipBtn.visibility = if (m == ModeDial.FILE) View.INVISIBLE else View.VISIBLE
 
-        if (old == ModeDial.FILE && m != ModeDial.FILE && loadedBitmap != null) {
-            loadedBitmap = null; dial.fileLoaded = false; renderer.clearBitmap()
-        }
+        if (old == ModeDial.FILE && m != ModeDial.FILE) clearFile()
         when (m) {
             ModeDial.VIDEO -> { ensureMic(); startCamera() }
             ModeDial.PHOTO -> startCamera()
-            ModeDial.FILE -> if (loadedBitmap == null && old != ModeDial.FILE) openPicker()
+            ModeDial.FILE -> if (!fileLoaded() && old != ModeDial.FILE) openPicker()
         }
         updateModeLabel()
         glView.requestRender()
     }
 
+    /** The center of the dial was tapped. What it does depends on the mode. */
     private fun shutter() {
         when (mode) {
             ModeDial.PHOTO -> takePhoto()
             ModeDial.VIDEO -> if (recording) stopRecording() else startRecording()
-            ModeDial.FILE -> if (loadedBitmap == null) openPicker() else saveDrawing()
+            ModeDial.FILE -> when {
+                exporting -> exporter?.cancel()                 // tap again to stop a save
+                videoUri != null -> exportVideo()
+                loadedBitmap != null -> saveDrawing()
+                else -> openPicker()
+            }
         }
     }
 
     private fun updateModeLabel() {
-        if (recording) return
+        if (recording || exporting) return
         modeLabel.setTextColor(Gloss.TEXT)
         modeLabel.text = when (mode) {
             ModeDial.PHOTO -> "Photo"
             ModeDial.VIDEO -> "Video"
-            else -> if (loadedBitmap == null) "File: tap to pick a photo" else "File: tap to save, hold to pick another"
+            else -> when {
+                videoUri != null -> "File: tap to save the video, hold to pick another"
+                loadedBitmap != null -> "File: tap to save, hold to pick another"
+                else -> "File: tap to pick a photo or video"
+            }
         }
     }
 
-    /** Degrees clockwise to turn saved output so it matches how the phone was held. */
+    /** Degrees clockwise to turn a saved photo or video so it matches how the phone was held. */
     private fun outRotation(): Int = if (settings.mirror) (360 - deviceRot) % 360 else deviceRot
 
     // ========================================================================
-    // Camera
+    // Camera (CameraX)
     // ========================================================================
     private fun startCamera() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
             val provider = future.get()
-            if (mode == ModeDial.FILE && loadedBitmap != null) { provider.unbindAll(); return@addListener }   // save battery
+            // With a photo or video loaded in File mode the camera isn't needed, so turn it off to save battery
+            if (mode == ModeDial.FILE && fileLoaded()) { provider.unbindAll(); return@addListener }
 
-            // Portrait = 4:3, landscape = 16:9. Photo mode gets more pixels; video stays light.
+            // Upright = 4:3, sideways = 16:9. Photo mode gets more pixels; video stays lighter so it keeps up.
             val ratio = if (landscapeHeld) AspectRatio.RATIO_16_9 else AspectRatio.RATIO_4_3
             val long = if (mode == ModeDial.PHOTO) 1920 else 1280
             val short = if (ratio == AspectRatio.RATIO_16_9) long * 9 / 16 else long * 3 / 4
@@ -494,6 +538,7 @@ class MainActivity : AppCompatActivity() {
                 .build()
             val preview = Preview.Builder().setResolutionSelector(selector).build()
             val exec = ContextCompat.getMainExecutor(this)
+            // CameraX asks for somewhere to send frames; the renderer hands it a Surface
             preview.setSurfaceProvider(exec) { req -> renderer.provideSurface(req, exec) }
             val lens = if (useFront) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
             try { provider.unbindAll(); provider.bindToLifecycle(this, lens, preview) }
@@ -504,7 +549,7 @@ class MainActivity : AppCompatActivity() {
     private fun flipCamera() {
         if (recording) return
         useFront = !useFront
-        settings.mirror = useFront
+        settings.mirror = useFront              // selfies look right mirrored, like a mirror
         pushSettings()
         startCamera()
     }
@@ -515,7 +560,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ========================================================================
-    // Photo mode + File mode saving
+    // Saving stills (Photo mode, and a photo in File mode)
     // ========================================================================
     private fun takePhoto() {
         flash()
@@ -524,9 +569,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun saveDrawing() {
         flash()
-        renderer.requestPhoto(0) { bmp -> saveBitmap(bmp) }
+        renderer.requestPhoto(0) { bmp -> saveBitmap(bmp) }   // gallery photos are already upright
     }
 
+    /** A quick dim and back, so you can see the shot was taken. */
     private fun flash() {
         glView.animate().alpha(0.25f).setDuration(60).withEndAction { glView.animate().alpha(1f).setDuration(160).start() }.start()
     }
@@ -535,16 +581,17 @@ class MainActivity : AppCompatActivity() {
         if (bmp == null) { toast("Couldn't capture. Try again."); return }
         Thread {
             val ok = writeJpeg(bmp)
-            runOnUiThread { toast(if (ok) "Saved to Pictures/PencilCam" else "Couldn't save the photo.") }
+            runOnUiThread { toast(if (ok) "Saved to Pictures/ViewSmith" else "Couldn't save the photo.") }
         }.start()
     }
 
+    /** Write a JPEG into Pictures/ViewSmith. IS_PENDING hides it from the gallery until it's fully written. */
     private fun writeJpeg(bmp: Bitmap): Boolean {
-        val name = "PencilCam_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".jpg"
+        val name = "ViewSmith_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".jpg"
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, name)
             put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/PencilCam")
+            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/ViewSmith")
             put(MediaStore.Images.Media.IS_PENDING, 1)
         }
         val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return false
@@ -556,10 +603,27 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ========================================================================
-    // File mode: pick a photo from the gallery
+    // File mode: pick a photo or video from the gallery
     // ========================================================================
     private fun openPicker() {
-        pickImage.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+        pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
+    }
+
+    /** Something was picked. Check whether it's a video or a photo. */
+    private fun loadPicked(uri: Uri) {
+        val type = contentResolver.getType(uri) ?: ""
+        if (type.startsWith("video/")) loadVideo(uri) else loadImage(uri)
+    }
+
+    /** Drop whatever File mode had loaded and stop the video, if one was playing. */
+    private fun clearFile() {
+        stopPlayer()
+        if (videoUri != null) {
+            renderer.clearVideo()
+            videoUri = null; videoInfo = null; videoSurface = null
+        }
+        if (loadedBitmap != null) { loadedBitmap = null; renderer.clearBitmap() }
+        dial.fileLoaded = false
     }
 
     private fun loadImage(uri: Uri) {
@@ -568,33 +632,110 @@ class MainActivity : AppCompatActivity() {
             val bmp = try {
                 val src = ImageDecoder.createSource(contentResolver, uri)
                 ImageDecoder.decodeBitmap(src) { dec, info, _ ->
-                    dec.allocator = ImageDecoder.ALLOCATOR_SOFTWARE        // GPU upload needs a normal bitmap
+                    dec.allocator = ImageDecoder.ALLOCATOR_SOFTWARE        // the GPU upload needs a plain bitmap in memory
                     val s = info.size
-                    val scale = min(1f, 2048f / max(s.width, s.height))      // keep under the GPU's comfort zone
+                    val scale = min(1f, 2048f / max(s.width, s.height))      // big photos get scaled to 2048 on the long side
                     dec.setTargetSize((s.width * scale).roundToInt().coerceAtLeast(1), (s.height * scale).roundToInt().coerceAtLeast(1))
                 }.let { if (it.config != Bitmap.Config.ARGB_8888) it.copy(Bitmap.Config.ARGB_8888, false) else it }
             } catch (e: Exception) { null }
             runOnUiThread {
                 if (bmp == null) { toast("Couldn't open that photo."); updateModeLabel(); return@runOnUiThread }
                 if (mode != ModeDial.FILE) return@runOnUiThread
+                // Switching from a video to a photo: shut the video down first
+                if (videoUri != null) {
+                    stopPlayer(); renderer.clearVideo()
+                    videoUri = null; videoInfo = null; videoSurface = null
+                }
                 loadedBitmap = bmp
                 dial.fileLoaded = true
                 renderer.showBitmap(bmp)
-                startCamera()                                   // unbinds the camera while a photo is shown
+                startCamera()                                   // turns the camera off while a file is showing
                 updateModeLabel()
             }
         }.start()
     }
 
+    private fun loadVideo(uri: Uri) {
+        modeLabel.text = "Loading..."
+        Thread {
+            val info = VideoInfo.read(this, uri)
+            runOnUiThread {
+                if (info == null) { toast("Couldn't open that video."); updateModeLabel(); return@runOnUiThread }
+                if (mode != ModeDial.FILE) return@runOnUiThread
+                stopPlayer()
+                if (loadedBitmap != null) { loadedBitmap = null; renderer.clearBitmap() }
+                videoUri = uri; videoInfo = info; videoSurface = null
+                dial.fileLoaded = true
+                openVideoInRenderer(uri, info)
+                startCamera()                                   // turns the camera off while a file is showing
+                updateModeLabel()
+            }
+        }.start()
+    }
+
+    /** Ask the renderer for a Surface to decode into, then start playback once it's ready. */
+    private fun openVideoInRenderer(uri: Uri, info: VideoInfo) {
+        renderer.openVideo(info.width, info.height, info.rotation) { surface ->
+            if (videoUri != uri) return@openVideo           // something else got picked in the meantime
+            videoSurface = surface
+            if (mode == ModeDial.FILE) startPlayer()
+        }
+    }
+
+    /** The GPU was reset and the video's Surface went with it. Set it back up. */
+    private fun reopenVideo() {
+        val u = videoUri ?: return; val i = videoInfo ?: return
+        stopPlayer(); videoSurface = null
+        openVideoInRenderer(u, i)
+    }
+
+    private fun startPlayer() {
+        val u = videoUri ?: return; val s = videoSurface ?: return
+        if (exporting) return
+        stopPlayer()
+        player = VideoPlayer(this, u, s).also { it.start() }
+    }
+
+    private fun stopPlayer() {
+        player?.stop(); player = null
+    }
+
+    /** Save a sketched copy of the loaded video. The dial turns red; tap it again to cancel. */
+    private fun exportVideo() {
+        val u = videoUri; val info = videoInfo; val surf = videoSurface
+        if (u == null || info == null || surf == null) { toast("The video isn't ready yet."); return }
+        if (openTab != null) closePanel()
+        stopPlayer()                                         // the exporter takes over the decoder Surface
+        val size = SketchRenderer.videoProcSize(info.width, info.height, info.rotation)
+        val ex = VideoExporter(this, u, surf, renderer, size.width, size.height, info.durationUs,
+            onProgress = { pct -> if (exporting) showSaving(pct) },
+            onDone = { _, msg ->
+                exporter = null
+                dial.recording = false; dial.locked = false
+                toast(msg)
+                updateModeLabel()
+                if (mode == ModeDial.FILE) startPlayer()     // back to looping the original
+            })
+        exporter = ex
+        dial.recording = true; dial.locked = true
+        showSaving(0)
+        ex.start()
+    }
+
+    private fun showSaving(pct: Int) {
+        modeLabel.setTextColor(Gloss.REC_RED)
+        modeLabel.text = "Saving video $pct%   tap to cancel"
+    }
+
     // ========================================================================
-    // Video recording
+    // Video mode: recording the live drawing
     // ========================================================================
     private fun startRecording() {
         val size = renderer.procSize
         if (size.width == 0) { toast("Camera isn't ready yet."); return }
         val audio = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         val rec = VideoRecorder(this)
-        // Encoders like even sizes
+        // Video encoders want even numbers for width and height
         val w = size.width and 1.inv(); val h = size.height and 1.inv()
         if (!rec.prepare(w, h, outRotation(), audio)) { toast("Couldn't start recording."); return }
         try { rec.start() } catch (e: Exception) { rec.abandon(); toast("Couldn't start recording."); return }
@@ -614,25 +755,27 @@ class MainActivity : AppCompatActivity() {
         flipBtn.isEnabled = true; flipBtn.alpha = 1f
         updateModeLabel()
         if (fromPause) { renderer.stopRecording { }; rec.stop(); return }
+        // Let the renderer finish its last frame before closing the file
         renderer.stopRecording {
             val ok = !failed && rec.stop()
             if (failed) rec.abandon()
-            toast(if (ok) "Saved to Movies/PencilCam" else "Video wasn't saved.")
+            toast(if (ok) "Saved to Movies/ViewSmith" else "Video wasn't saved.")
         }
     }
 
+    /** Updates the red REC timer twice a second while recording. */
     private val recTimer = object : Runnable {
         override fun run() {
             if (!recording) return
             val s = (SystemClock.elapsedRealtime() - recStart) / 1000
             modeLabel.setTextColor(Gloss.REC_RED)
-            modeLabel.text = "\u25CF REC  %02d:%02d".format(s / 60, s % 60)
+            modeLabel.text = "● REC  %02d:%02d".format(s / 60, s % 60)
             handler.postDelayed(this, 500)
         }
     }
 
     // ========================================================================
-    // Side tabs and slider groups
+    // Side tabs and their slide-out panel
     // ========================================================================
     private fun toggleTab(name: String) {
         if (openTab == name) { closePanel(); return }
@@ -650,7 +793,7 @@ class MainActivity : AppCompatActivity() {
         popOut(panel) { openTab == null }
     }
 
-    // Menus grow in / shrink out from their center (works at any rotation)
+    // Menus grow in and shrink out from their center, which looks right at any angle
     private fun popIn(v: View) {
         v.animate().cancel()
         if (v.visibility != View.VISIBLE) { v.visibility = View.VISIBLE; v.alpha = 0f; v.scaleX = 0.92f; v.scaleY = 0.92f }
@@ -696,13 +839,17 @@ class MainActivity : AppCompatActivity() {
         check("Remember my look between launches", { rememberLook }, { rememberLook = it; saveUiPrefs() })
 
         button("Close") { closeSettings() }
-        button("Exit PencilCam", danger = true) {
-            // Stopping a recording is handled by onPause, so a video in progress still saves
+        button("Exit ViewSmith", danger = true) {
+            // onPause still runs on the way out, so a video being recorded still gets saved
             finishAndRemoveTask()
         }
-        note("PencilCam v0.3")
+        note("ViewSmith v${appVersion()}")
         settingsRefreshers.forEach { it() }
     }
+
+    /** The version number from app/build.gradle.kts, so there's only one place to change it. */
+    private fun appVersion(): String =
+        try { packageManager.getPackageInfo(packageName, 0).versionName ?: "" } catch (e: Exception) { "" }
 
     private fun setMenuOpacity(v: Float) {
         uiOpacity = v.coerceIn(0f, 1f)
@@ -722,19 +869,26 @@ class MainActivity : AppCompatActivity() {
             .putBoolean("keepAwake", keepAwake).putBoolean("rememberLook", rememberLook).apply()
     }
 
-    /** Push the app settings onto the live screen. */
+    /** Put the app settings into effect on the live screen. */
     private fun applyUiPrefs() {
         panelBg.opacity = uiOpacity; settingsBg.opacity = uiOpacity
-        dial.isHapticFeedbackEnabled = haptics          // the dial's ticks respect this switch
+        dial.isHapticFeedbackEnabled = haptics          // the dial's clicks follow this switch
         if (keepAwake) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 
+    // ========================================================================
+    // What's in each side tab
+    // ========================================================================
     private val refreshers = mutableListOf<() -> Unit>()
 
-    // The row builders below (heading, slider, check...) add to whichever menu is being built
+    // The row builders below (heading, slider, check...) add to whichever menu
+    // is being built right now, and register a "refresher" that sets the
+    // control to the current value.
     private lateinit var target: LinearLayout
     private lateinit var targetRefreshers: MutableList<() -> Unit>
+
+    private val styleNames = listOf("Pencil", "Ink pen", "Colored pencil", "Comic", "Halftone", "Watercolor", "Chalkboard")
 
     private fun buildGroup(name: String) {
         panelContent.removeAllViews(); refreshers.clear()
@@ -743,7 +897,7 @@ class MainActivity : AppCompatActivity() {
             "Style" -> {
                 heading("Drawing style")
                 val group = RadioGroup(this)
-                listOf("Pencil", "Ink pen", "Colored pencil").forEachIndexed { i, label ->
+                styleNames.forEachIndexed { i, label ->
                     group.addView(RadioButton(this).apply {
                         id = 1000 + i; text = label; setTextColor(Gloss.TEXT); shade()
                         buttonTintList = ColorStateList.valueOf(Gloss.SILVER_1)
@@ -752,11 +906,11 @@ class MainActivity : AppCompatActivity() {
                 group.setOnCheckedChangeListener { _, id -> if (id >= 1000) { settings.style = id - 1000; pushSettings() } }
                 panelContent.addView(group)
                 refreshers += { group.check(1000 + settings.style) }
-                note("More looks (comic, halftone, watercolor) land here as they're built.")
+                note("Comic and Halftone use Stroke spacing (Shade tab) for their dot size.")
 
                 heading("Setup")
                 check("Mirror image", { settings.mirror }, { settings.mirror = it })
-                button("Rotate camera 90\u00B0") { settings.rotationFix = (settings.rotationFix + 1) % 4; pushSettings() }
+                button("Rotate camera 90°") { settings.rotationFix = (settings.rotationFix + 1) % 4; pushSettings() }
                 button("Reset all sliders") {
                     settings = SketchSettings(mirror = settings.mirror, rotationFix = settings.rotationFix)
                     pushSettings(); refreshers.forEach { it() }
@@ -789,8 +943,8 @@ class MainActivity : AppCompatActivity() {
             }
             "Shade" -> {
                 heading("Shading")
-                slider("Crosshatching", 0f, 1f, 0.01f, { settings.hatch }, { settings.hatch = it }) { pct(it) }
-                slider("Stroke spacing", 3f, 14f, 0.5f, { settings.spacing }, { settings.spacing = it }) { "%.1f".format(it) }
+                slider("Shading", 0f, 1f, 0.01f, { settings.hatch }, { settings.hatch = it }) { pct(it) }
+                slider("Stroke / dot spacing", 3f, 14f, 0.5f, { settings.spacing }, { settings.spacing = it }) { "%.1f".format(it) }
             }
             "Paper" -> {
                 heading("Paper")
@@ -806,13 +960,14 @@ class MainActivity : AppCompatActivity() {
         refreshers.forEach { it() }
     }
 
+    /** Send the current look to the renderer, save it, and redraw. */
     private fun pushSettings() {
         renderer.settings = settings.copy()
         settings.save(prefs)
         glView.requestRender()
     }
 
-    // ---- Little builders for panel rows
+    // ---- Small builders for menu rows
     /** Dark halo behind light text, so it stays readable over white paper when the menu is see-through. */
     private fun TextView.shade() = setShadowLayer(6f, 0f, 1.5f, Color.argb(235, 0, 0, 0))
 
@@ -827,6 +982,7 @@ class MainActivity : AppCompatActivity() {
             this.text = text; setTextColor(Gloss.TEXT_DIM); textSize = 12f; setPadding(0, dp(4), 0, 0); shade()
         })
     }
+    /** Silver push button. danger = red bold text, for Exit. */
     private fun button(label: String, danger: Boolean = false, action: () -> Unit) {
         target.addView(TextView(this).apply {
             text = label; textSize = 14f; gravity = Gravity.CENTER
@@ -838,6 +994,10 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { action() }
         }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) })
     }
+    /**
+     * A labeled slider. Android's SeekBar only does whole steps from 0 up,
+     * so the value is mapped: value = min + steps * step.
+     */
     private fun slider(label: String, min: Float, max: Float, step: Float,
                        get: () -> Float, set: (Float) -> Unit, fmt: (Float) -> String) {
         val title = TextView(this).apply { setTextColor(Gloss.TEXT); textSize = 13f; shade() }

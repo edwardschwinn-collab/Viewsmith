@@ -1,8 +1,8 @@
 # ============================================================================
-# GitHub Actions workflow: builds the APK on GitHub's servers.
-# The project now lives directly in the repo (no more PencilCam-src.zip),
-# so Claude Code can edit, commit, and push real files.
-# Every push to main builds a fresh APK under Actions > Artifacts.
+# GitHub Actions: builds the ViewSmith APK on GitHub's servers.
+# Runs on every push to main. It can also be started by hand from the
+# Actions tab ("Run workflow") on any branch, to test a change before it
+# goes to main. The APK shows up under the run's Artifacts as ViewSmith-apk.
 # ============================================================================
 name: Build APK
 
@@ -15,7 +15,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      # 1. Grab the repo
+      # 1. Grab the code
       - uses: actions/checkout@v4
 
       # 2. Install Java 17
@@ -29,12 +29,12 @@ jobs:
         with:
           gradle-version: '8.11.1'
 
-      # 4. Build the APK from the repo root
+      # 4. Build the APK
       - name: Build debug APK
         run: gradle assembleDebug --no-daemon --stacktrace
 
-      # 5. Save the APK so you can download it
+      # 5. Keep the APK so it can be downloaded
       - uses: actions/upload-artifact@v4
         with:
-          name: PencilCam-apk
+          name: ViewSmith-apk
           path: app/build/outputs/apk/debug/*.apk

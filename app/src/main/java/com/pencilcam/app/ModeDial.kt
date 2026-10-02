@@ -24,14 +24,19 @@ import kotlin.math.sin
 
 /**
  * ============================================================================
- * ModeDial: the shutter.
- *   - Outer silver ring: DRAG it around like a real camera dial. It clicks
- *     (haptic tick) into PHOTO / VIDEO / FILE. The mode lined up with the
- *     notch at the top is the active one.
- *   - Center black-glass button: TAP to shoot / record / pick-or-save.
- *     LONG-PRESS in File mode picks a different photo.
- * Lighting is fixed from above: the ring's tick marks rotate, but the
- * shine never moves, just like a real polished dial.
+ * ModeDial: the shutter button, built like the mode dial on a real camera.
+ *
+ *   Outer silver ring: drag it around with your thumb. It clicks (a small
+ *   vibration) as it passes PHOTO, VIDEO, and FILE. Whichever one lines up
+ *   with the notch at the top is the mode you're in.
+ *
+ *   Black glass button in the middle: tap it to take a photo, start or stop
+ *   a video, or pick and save a file. In File mode, press and hold to pick a
+ *   different photo or video. It turns red while recording or saving.
+ *
+ * The light comes from straight above, like everywhere else in the app.
+ * When the ring turns, only the tick marks and labels move. The shine on
+ * the metal stays put, the way it would on a real polished dial.
  * ============================================================================
  */
 class ModeDial(context: Context) : View(context) {

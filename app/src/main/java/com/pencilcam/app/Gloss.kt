@@ -20,10 +20,14 @@ import kotlin.math.sin
 
 /**
  * ============================================================================
- * Gloss: the black-glass and polished-silver look.
- * RULE: one light source, straight above. So every highlight sits at the TOP
- * of a shape, every shadow falls BELOW it, and silver gradients run
- * bright-at-top to dark-at-bottom. Keep to that and everything matches.
+ * Gloss: the black glass and polished silver look used on every control.
+ *
+ * The whole app is lit by one light, straight overhead. That means every
+ * highlight sits at the TOP of a shape, every shadow falls BELOW it, and
+ * silver runs bright at the top to dark at the bottom. When a control turns
+ * with the phone, only its icon or label turns. The glass and its shine
+ * stay where they are, because the light didn't move. Stick to that and
+ * everything looks like it belongs together.
  * ============================================================================
  */
 object Gloss {
@@ -71,7 +75,7 @@ class GlossPanelDrawable(private val radius: Float) : Drawable() {
 
     override fun draw(c: Canvas) {
         val b = RectF(bounds); b.inset(1f, 1f)
-        // Glass body: same colors as v0.2, alpha scaled by the opacity setting
+        // Glass body: dark at the top, darker at the bottom, see-through by the opacity setting
         fill.shader = LinearGradient(0f, b.top, 0f, b.bottom,
             Color.argb((235 * opacity).toInt(), 34, 37, 42), Color.argb((245 * opacity).toInt(), 6, 7, 8), Shader.TileMode.CLAMP)
         c.drawRoundRect(b, radius, radius, fill)

@@ -1,7 +1,7 @@
 // ============================================================================
 // settings.gradle.kts
-// Tells Gradle (the Android build tool) where to download libraries from,
-// and which modules make up this project. We only have one module: "app".
+// Tells Gradle (the Android build tool) where to download libraries from
+// and which parts make up the project. There's only one part: "app".
 // ============================================================================
 pluginManagement {
     repositories {
@@ -17,5 +17,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "PencilCam"
+rootProject.name = "ViewSmith"
 include(":app")

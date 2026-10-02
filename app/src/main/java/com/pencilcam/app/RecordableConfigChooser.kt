@@ -7,8 +7,15 @@ import javax.microedition.khronos.egl.EGLDisplay
 
 /**
  * ============================================================================
- * Picks a GPU drawing setup that is also allowed to feed the video encoder
- * ("recordable"). Without this, drawing into the recorder's surface fails.
+ * RecordableConfigChooser
+ * When GLSurfaceView starts up it has to pick a pixel format for the GPU
+ * (an "EGL config"). This picks one that is also marked "recordable", which
+ * means it can draw into a video encoder as well as the screen. Without it,
+ * recording and saving videos fail on a lot of phones.
+ *
+ * Asks for 8 bits each of red, green, blue, and alpha with OpenGL ES 3.
+ * If no recordable one exists, it falls back to the same thing without
+ * the recordable flag, so the app still runs (just without video).
  * ============================================================================
  */
 class RecordableConfigChooser : GLSurfaceView.EGLConfigChooser {

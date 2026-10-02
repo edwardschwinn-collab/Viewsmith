@@ -1,3 +1,4 @@
 <resources>
-    <string name="app_name">PencilCam</string>
+    <!-- The name shown under the icon on the home screen -->
+    <string name="app_name">ViewSmith</string>
 </resources>
