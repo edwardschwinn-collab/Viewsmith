@@ -64,6 +64,18 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
     @Volatile var onRecordError: ((String) -> Unit)? = null
     /** Size of the picture being drawn right now. The screen reads this before recording. */
     @Volatile var procSize = Size(0, 0); private set
+    /**
+     * How big to draw the camera picture, as its short side in pixels
+     * (720, 1080, 1440, 2160). 0 = just use whatever size the camera sends.
+     * Video mode sets this to the recording size. The drawing is made up of
+     * strokes the GPU draws fresh every frame, so drawing bigger than the
+     * camera sends still gives crisp lines.
+     */
+    @Volatile var cameraShort = 0
+    /** Short side for video files playing on screen in File mode (saving uses its own size). */
+    @Volatile var videoPreviewShort = 1080
+    /** Which picture edge is the viewer's bottom (0, 90, 180, 270), for the polaroid border and glossy shine. */
+    @Volatile var frameRot = 0
 
     // ---- Camera input
     // CameraX asks for a Surface to send frames into. I make one from a
@@ -104,14 +116,14 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
     // The exporter feeds decoded frames in one at a time. For each one I draw
     // the sketch into the encoder's Surface, stamp it with the frame's own
     // time, and tell the exporter it's done so it can send the next frame.
-    private class ExportReq(val surface: Surface, val w: Int, val h: Int,
+    private class ExportReq(val surface: Surface, val w: Int, val h: Int, val short: Int,
                             val onFrame: (Long) -> Unit, val onReady: (Boolean) -> Unit)
     @Volatile private var pendingExport: ExportReq? = null
     @Volatile private var stopExportReq: (() -> Unit)? = null
     /** The exporter sets this to the time stamp (ns) of the frame it just sent, so I know which frame to save. */
     @Volatile var exportExpectNs = -1L
     private var exportEgl: EGLSurface? = null
-    private var exportW = 0; private var exportH = 0
+    private var exportW = 0; private var exportH = 0; private var exportShort = 1080
     private var exportOnFrame: ((Long) -> Unit)? = null
     private var exportClockNs = 0L
 
@@ -120,10 +132,27 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
     @Volatile private var photoReq: PhotoReq? = null
 
     // ---- Camera recording (Video mode)
-    @Volatile private var pendingEncSurface: Surface? = null
+    // turn = true when the encoder only takes wide frames, so the drawing
+    // goes in sideways (see DRAW_VS in Shaders.kt)
+    private class EncReq(val surface: Surface, val w: Int, val h: Int, val turn: Boolean)
+    @Volatile private var pendingEncSurface: EncReq? = null
     @Volatile private var stopEncReq: (() -> Unit)? = null
     private var encSurface: EGLSurface? = null
+    private var encW = 0; private var encH = 0; private var encTurn = false
     private var lastEncNs = 0L
+
+    // ---- Keeping up: are camera frames being drawn as fast as they arrive?
+    // The camera thread counts frames arriving; the GL thread counts frames
+    // it actually drew. If the GPU falls behind, frames get skipped and the
+    // drawn count drops below the arrived count. Measured over ~1.5 seconds.
+    private val camArrived = java.util.concurrent.atomic.AtomicLong(0)
+    private var camDrawn = 0L
+    private var perfStartNs = 0L; private var perfArrived0 = 0L; private var perfDrawn0 = 0L
+    private var perfSizeW = 0; private var perfSizeH = 0
+    /** The latest measurement, or null if there isn't a fresh one yet. */
+    @Volatile var perf: Perf? = null; private set
+    /** arrivedFps = camera frames per second, drawnFps = frames the GPU kept up with, at size w x h. */
+    class Perf(val arrivedFps: Float, val drawnFps: Float, val w: Int, val h: Int)
 
     // ---- Shader programs, the full screen rectangle, and the off-screen images
     private var pCopy = 0; private var pCopy2D = 0; private var pBlurH = 0; private var pBlurV = 0; private var pDraw = 0
@@ -162,13 +191,18 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
     /** Done with the video. Stop the decoder BEFORE calling this. */
     fun clearVideo() { clearVideoReq = true; view.requestRender() }
 
-    fun startExport(surface: Surface, w: Int, h: Int, onFrame: (Long) -> Unit, onReady: (Boolean) -> Unit) {
-        pendingExport = ExportReq(surface, w, h, onFrame, onReady); view.requestRender()
+    /**
+     * Start saving a video file. surface = the encoder's input, w x h = the
+     * encoder's size, short = the short side to draw the clip at while saving.
+     */
+    fun startExport(surface: Surface, w: Int, h: Int, short: Int, onFrame: (Long) -> Unit, onReady: (Boolean) -> Unit) {
+        pendingExport = ExportReq(surface, w, h, short, onFrame, onReady); view.requestRender()
     }
     fun stopExport(done: () -> Unit) { stopExportReq = done; view.requestRender() }
 
     fun requestPhoto(rotation: Int, cb: (Bitmap?) -> Unit) { photoReq = PhotoReq(rotation, cb); view.requestRender() }
-    fun startRecording(s: Surface) { pendingEncSurface = s; view.requestRender() }
+    /** Start drawing into the camera recorder. w x h is the recorder's frame size; turn = feed it sideways. */
+    fun startRecording(s: Surface, w: Int, h: Int, turn: Boolean) { pendingEncSurface = EncReq(s, w, h, turn); view.requestRender() }
     fun stopRecording(done: () -> Unit) { stopEncReq = done; view.requestRender() }
 
     // ========================================================================
@@ -183,7 +217,7 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
         pCopy2D = program(Shaders.QUAD_VS, Shaders.COPY2D_FS)
         pBlurH = program(Shaders.QUAD_VS, Shaders.BLUR_H_FS)
         pBlurV = program(Shaders.QUAD_VS, Shaders.BLUR_V_FS)
-        pDraw = program(Shaders.QUAD_VS, Shaders.DRAW_FS)
+        pDraw = program(Shaders.DRAW_VS, Shaders.DRAW_FS)
 
         // This runs on first start, and again if Android ever throws away the
         // GPU context. Either way, any old textures are gone, so start clean
@@ -213,7 +247,7 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
         // ---- Pull in the newest camera frame, if one came in
         surfaceTexture?.let { st ->
             if (frameAvailable.getAndSet(false)) {
-                try { st.updateTexImage(); st.getTransformMatrix(stMatrix); gotFrame = true }
+                try { st.updateTexImage(); st.getTransformMatrix(stMatrix); gotFrame = true; camDrawn++ }
                 catch (e: Exception) { Log.w(TAG, "camera updateTexImage failed", e) }
             }
         }
@@ -263,17 +297,28 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
         val w: Int; val h: Int
         when {
             useBitmap -> { w = bmpW; h = bmpH }
-            useVideo -> { val sz = videoProcSize(vidW, vidH, vidRot); w = sz.width; h = sz.height }
+            useVideo -> {
+                val sz = videoProcSize(vidW, vidH, vidRot, if (exporting) exportShort else videoPreviewShort)
+                w = sz.width; h = sz.height
+            }
             else -> {
                 // The camera's SurfaceTexture already turns frames upright for a
                 // portrait phone, so upright is the sensor size with width and height swapped.
                 var nw = min(camW, camH); var nh = max(camW, camH)
                 if (s.rotationFix % 2 == 1) { val t = nw; nw = nh; nh = t }
+                // Video mode: scale to the recording size (same shape)
+                val cs = cameraShort
+                if (cs > 0) {
+                    val sc = cs.toFloat() / min(nw, nh)
+                    nw = ((nw * sc).roundToInt() and 1.inv()).coerceAtLeast(2)
+                    nh = ((nh * sc).roundToInt() and 1.inv()).coerceAtLeast(2)
+                }
                 w = nw; h = nh
             }
         }
         if (!ensureTargets(w, h)) return
         procSize = Size(w, h)
+        if (!useBitmap && !useVideo) measurePerf(w, h)
         val k = min(w, h) / 720f                          // 720 units -> real pixels
         val src = srcT!!; val a = blurA!!; val b = blurB!!
 
@@ -336,6 +381,25 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
         if (useBitmap && animate) view.postDelayed({ view.requestRender() }, 30)
     }
 
+    /**
+     * Every 1.5 seconds, work out how many camera frames came in per second
+     * and how many actually got drawn. Starts over whenever the drawing size
+     * changes, since a new size means new performance.
+     */
+    private fun measurePerf(w: Int, h: Int) {
+        val now = System.nanoTime()
+        if (w != perfSizeW || h != perfSizeH || perfStartNs == 0L) {
+            perfSizeW = w; perfSizeH = h; perf = null
+            perfStartNs = now; perfArrived0 = camArrived.get(); perfDrawn0 = camDrawn
+            return
+        }
+        val dt = (now - perfStartNs) / 1e9f
+        if (dt < 1.5f) return
+        val arrived = camArrived.get()
+        perf = Perf((arrived - perfArrived0) / dt, (camDrawn - perfDrawn0) / dt, w, h)
+        perfStartNs = now; perfArrived0 = arrived; perfDrawn0 = camDrawn
+    }
+
     /** Pass 0 for an OES source (camera or video): rotate, mirror, copy. */
     private fun copyExternal(tex: Int, matrix: FloatArray, rotation: Float, mirror: Boolean) {
         GLES20.glUseProgram(pCopy)
@@ -369,7 +433,7 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
         val pr = pending ?: return
         pending = null
         val request = pr.request
-        val (tex, st) = makeOes { frameAvailable.set(true) }
+        val (tex, st) = makeOes { frameAvailable.set(true); camArrived.incrementAndGet() }
         st.setDefaultBufferSize(request.resolution.width, request.resolution.height)
         val surface = Surface(st)
         oesTex = tex; surfaceTexture = st
@@ -446,8 +510,13 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
         return if (es == null || es == EGL14.EGL_NO_SURFACE) null else es
     }
 
-    /** Draw the sketch into an encoder surface at size ow x oh, stamped with time tNs. */
-    private fun drawInto(es: EGLSurface, ow: Int, oh: Int, tNs: Long,
+    /**
+     * Draw the sketch into an encoder surface at size ow x oh, stamped with
+     * time tNs. The sketch is worked out per spot from 0 to 1 across the
+     * picture, so it fills any output size; ow x oh doesn't have to match
+     * the drawing size. turn = draw it a quarter turn sideways.
+     */
+    private fun drawInto(es: EGLSurface, ow: Int, oh: Int, tNs: Long, turn: Boolean,
                          s: SketchSettings, src: Target, blur: Target, w: Int, h: Int, k: Float) {
         val dpy = EGL14.eglGetCurrentDisplay()
         val ctx = EGL14.eglGetCurrentContext()
@@ -456,7 +525,7 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
         if (!EGL14.eglMakeCurrent(dpy, es, es, ctx)) return
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
         GLES20.glViewport(0, 0, ow, oh)
-        drawSketch(s, src, blur, w, h, k)
+        drawSketch(s, src, blur, w, h, k, turn)
         EGLExt.eglPresentationTimeANDROID(dpy, es, tNs)
         EGL14.eglSwapBuffers(dpy, es)
         EGL14.eglMakeCurrent(dpy, drawS, readS, ctx)
@@ -464,16 +533,16 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
 
     // ---- Camera recording (Video mode)
     private fun handleRecording(s: SketchSettings, src: Target, blur: Target, w: Int, h: Int, k: Float, now: Long) {
-        pendingEncSurface?.let { surf ->
+        pendingEncSurface?.let { req ->
             pendingEncSurface = null
-            val es = makeEncoderEgl(surf)
+            val es = makeEncoderEgl(req.surface)
             if (es == null) view.post { onRecordError?.invoke("This phone's GPU couldn't connect to the video recorder.") }
-            else { encSurface = es; lastEncNs = 0L }
+            else { encSurface = es; encW = req.w; encH = req.h; encTurn = req.turn; lastEncNs = 0L }
         }
         val es = encSurface ?: return
         if (now - lastEncNs < 30_000_000L) return         // about 30 frames a second is plenty
         lastEncNs = now
-        drawInto(es, w, h, now, s, src, blur, w, h, k)
+        drawInto(es, encW, encH, now, encTurn, s, src, blur, w, h, k)
     }
 
     private fun handleStopRecording() {
@@ -496,7 +565,7 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
         pendingExport = null
         val es = makeEncoderEgl(r.surface)
         if (es == null) { r.onReady(false); return }
-        exportEgl = es; exportW = r.w; exportH = r.h; exportOnFrame = r.onFrame
+        exportEgl = es; exportW = r.w; exportH = r.h; exportShort = r.short; exportOnFrame = r.onFrame
         exportClockNs = 0L; lastBoilNs = 0L; exportExpectNs = -1L
         // A frame left over from the on-screen playback must not end up in the saved file
         if (vidFrameAvailable.getAndSet(false)) try { vidST?.updateTexImage() } catch (_: Exception) {}
@@ -505,16 +574,24 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
 
     private fun drawToExport(s: SketchSettings, src: Target, blur: Target, w: Int, h: Int, k: Float, tNs: Long) {
         val es = exportEgl ?: return
-        drawInto(es, exportW, exportH, tNs, s, src, blur, w, h, k)
+        drawInto(es, exportW, exportH, tNs, false, s, src, blur, w, h, k)
     }
 
     // ========================================================================
     // Drawing helpers
     // ========================================================================
 
-    /** Pass 3: run the drawing shader with every slider value. */
-    private fun drawSketch(s: SketchSettings, src: Target, blur: Target, w: Int, h: Int, k: Float) {
+    /** Pass 3: run the drawing shader with every slider value, the look's own sliders, and the finishes. */
+    private fun drawSketch(s: SketchSettings, src: Target, blur: Target, w: Int, h: Int, k: Float, turn: Boolean = false) {
         GLES20.glUseProgram(pDraw)
+        GLES20.glUniform1f(loc(pDraw, "u_turn"), if (turn) 1f else 0f)
+        GLES20.glUniform3f(loc(pDraw, "u_p"), s.lookParam(0), s.lookParam(1), s.lookParam(2))
+        val on = s.finishOn; val fp = s.finishParams
+        fun b(i: Int) = if (on[i]) 1f else 0f
+        GLES20.glUniform4f(loc(pDraw, "u_finOn"), b(0), b(1), b(2), b(3))
+        GLES20.glUniform4f(loc(pDraw, "u_finA"), fp[0], fp[2], fp[4], fp[6])     // each finish's first slider
+        GLES20.glUniform4f(loc(pDraw, "u_finB"), fp[1], fp[3], fp[5], fp[7])     // and its second
+        GLES20.glUniform1f(loc(pDraw, "u_frameRot"), frameRot.toFloat())
         bindTex(0, blur.tex); GLES20.glUniform1i(loc(pDraw, "u_blur"), 0)
         bindTex(1, src.tex); GLES20.glUniform1i(loc(pDraw, "u_src"), 1)
         GLES20.glUniform2f(loc(pDraw, "u_res"), w / k, h / k)       // picture size in 720 units
@@ -621,19 +698,17 @@ class SketchRenderer(private val view: GLSurfaceView) : GLSurfaceView.Renderer {
     companion object {
         private const val TAG = "ViewSmith"
 
-        /** Longest side, in pixels, a video file is drawn at. 4K and 8K clips get scaled down to this. */
-        const val VIDEO_MAX_LONG = 1920
-
         /**
          * The upright size a video file is drawn at. A clip shot holding the
          * phone upright is stored sideways with rotation 90 or 270, so width
-         * and height swap. Then scale down to VIDEO_MAX_LONG, keeping sizes
-         * even because video encoders want that.
+         * and height swap. Then scale so the short side is `short` pixels
+         * (but never bigger than the clip itself), keeping sizes even
+         * because video encoders want that.
          */
-        fun videoProcSize(w: Int, h: Int, rotation: Int): Size {
+        fun videoProcSize(w: Int, h: Int, rotation: Int, short: Int): Size {
             val turned = ((rotation % 360) + 360) % 180 == 90
             val uw = if (turned) h else w; val uh = if (turned) w else h
-            val sc = min(1f, VIDEO_MAX_LONG.toFloat() / max(uw, uh))
+            val sc = min(1f, short.toFloat() / min(uw, uh))
             val ow = ((uw * sc).roundToInt() and 1.inv()).coerceAtLeast(2)
             val oh = ((uh * sc).roundToInt() and 1.inv()).coerceAtLeast(2)
             return Size(ow, oh)

@@ -105,7 +105,12 @@ class MaxHeightScrollView(context: Context) : ScrollView(context) {
     }
 }
 
-/** Square glossy tab button with a short label. Silver face when selected. */
+/**
+ * Square glossy tab button with a short label. Silver face when selected.
+ * badge > 0 adds a silver glow around the edge and a small silver disc in
+ * the top-right corner with the number on it (the Finish tab uses this to
+ * show how many finishes are stacked on).
+ */
 class GlossTab(context: Context, var label: String) : View(context) {
     var selectedTab = false
         set(v) { field = v; invalidate() }
@@ -113,13 +118,31 @@ class GlossTab(context: Context, var label: String) : View(context) {
      *  shine stay put, so the light still comes from above. */
     var iconRotation = 0f
         set(v) { field = v; invalidate() }
+    /** Count shown on the badge. 0 = no badge, no glow. */
+    var badge = 0
+        set(v) { field = v; invalidate() }
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
     private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
+
+    init {
+        // Let the glow and badge spill a little outside the button's box
+        clipToOutline = false
+    }
 
     override fun onDraw(c: Canvas) {
         val w = width.toFloat(); val h = height.toFloat()
         val r = min(w, h) * 0.24f
         val b = RectF(2f, 2f, w - 2f, h - 4f)
+        if (badge > 0) {
+            // Silver glow: a few soft rings fading outward, like light bouncing off polished metal
+            p.shader = null; p.style = Paint.Style.STROKE
+            for (i in 3 downTo 1) {
+                p.strokeWidth = i * 2.2f
+                p.color = Color.argb(70 / i, 230, 236, 242)
+                c.drawRoundRect(b, r, r, p)
+            }
+            p.style = Paint.Style.FILL
+        }
         // Soft shadow BELOW (light is above)
         p.shader = null; p.color = Color.argb(110, 0, 0, 0)
         c.drawRoundRect(RectF(b.left, b.top + 3f, b.right, b.bottom + 3f), r, r, p)
@@ -130,15 +153,34 @@ class GlossTab(context: Context, var label: String) : View(context) {
         // Glass highlight on the upper half
         p.shader = Gloss.highlight(b.top, b.centerY(), if (selectedTab) 150 else 90)
         c.drawRoundRect(RectF(b.left + 3, b.top + 3, b.right - 3, b.centerY()), r, r, p)
-        // Silver rim
-        p.shader = Gloss.silver(b.top, b.bottom); p.style = Paint.Style.STROKE; p.strokeWidth = 2.5f
+        // Silver rim (a bit thicker and brighter while the badge is showing)
+        p.shader = Gloss.silver(b.top, b.bottom); p.style = Paint.Style.STROKE; p.strokeWidth = if (badge > 0) 3.5f else 2.5f
         c.drawRoundRect(b, r, r, p); p.style = Paint.Style.FILL
         // Label
         text.textSize = h * 0.2f
         text.color = if (selectedTab) Color.parseColor("#15171A") else Gloss.TEXT
+        text.isFakeBoldText = false
         c.save(); c.rotate(iconRotation, w / 2f, b.centerY())
         c.drawText(label, w / 2f, b.centerY() + text.textSize * 0.35f, text)
         c.restore()
+
+        if (badge > 0) {
+            // Badge: a small silver disc tucked into the top-right corner.
+            // Shadow below it, silver bright at the top, a glint on top.
+            val br = min(w, h) * 0.17f
+            val bx = b.right - br * 0.55f; val by = b.top + br * 0.55f
+            p.shader = null; p.color = Color.argb(140, 0, 0, 0)
+            c.drawCircle(bx, by + 2f, br, p)
+            p.shader = Gloss.silver(by - br, by + br); c.drawCircle(bx, by, br, p)
+            p.shader = Gloss.highlight(by - br, by, 170)
+            c.drawOval(RectF(bx - br * 0.7f, by - br * 0.92f, bx + br * 0.7f, by - br * 0.1f), p)
+            p.shader = null
+            // The number turns with the phone; the disc and its shine don't
+            text.textSize = br * 1.25f; text.color = Color.parseColor("#15171A"); text.isFakeBoldText = true
+            c.save(); c.rotate(iconRotation, bx, by)
+            c.drawText(badge.toString(), bx, by + text.textSize * 0.36f, text)
+            c.restore()
+        }
     }
 }
 

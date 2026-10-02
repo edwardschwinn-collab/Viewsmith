@@ -61,10 +61,14 @@ import kotlin.math.roundToInt
  * ============================================================================
  * MainActivity: the one and only screen in ViewSmith.
  *
- * ViewSmith takes the live camera, a photo, or a video and redraws it as a
- * hand-drawn picture: pencil, ink pen, colored pencil, comic, halftone,
- * watercolor, or chalkboard. Lines can wobble a little from frame to frame
- * the way hand-drawn animation does.
+ * ViewSmith takes the live camera, a photo, or a video and redraws it in
+ * one of 13 looks (pencil, watercolor, oil painting, neon, a fake heat
+ * camera, and more, see Looks.kt). Finishes like a vignette or a polaroid
+ * border can be stacked on top. Lines can wobble a little from frame to
+ * frame the way hand-drawn animation does.
+ *
+ * Tabs down the side: Style (pick the look, plus its own sliders), Finish,
+ * Lines, Shade, Paper, and Motion. The cog opens Settings.
  *
  * The dial at the bottom picks the mode:
  *   PHOTO : live camera, tap to save a still drawing
@@ -113,6 +117,8 @@ class MainActivity : AppCompatActivity() {
     private var cogCorner = -1                           // which corner the cog is parked in (same as deviceRot)
     private val tabs = LinkedHashMap<String, GlossTab>()
     private var openTab: String? = null
+    private lateinit var lookLabel: TextView             // "Watercolor + Vignette" that fades in over the picture
+    private var lookBox: LinearLayout? = null            // the current look's own sliders, inside the Style tab
 
     // ---- State
     private lateinit var settings: SketchSettings
@@ -143,6 +149,11 @@ class MainActivity : AppCompatActivity() {
     private var haptics = true          // dial clicks
     private var keepAwake = true        // screen stays on while the app is open
     private var rememberLook = true     // reload the sliders and style on launch
+    private var videoShort = 1080       // video resolution, as the short side: 720, 1080, 1440, or 2160 (4K)
+
+    /** The Video resolution choices in Settings: label and short side in pixels. */
+    private val videoSizes = listOf("720p" to 720, "1080p" to 1080, "1440p" to 1440, "4K" to 2160)
+    private fun sizeName(short: Int) = videoSizes.firstOrNull { it.second == short }?.first ?: "${short}p"
 
     // ---- Permission requests and the gallery picker.
     // Android shows its own pop-up for these and calls back with the answer.
@@ -173,6 +184,7 @@ class MainActivity : AppCompatActivity() {
         settings = if (rememberLook) saved else SketchSettings(rotationFix = saved.rotationFix)
         buildScreen()
         applyUiPrefs()
+        updateFinishBadge()
         setMode(ModeDial.PHOTO, fromDial = false)
 
         // The back gesture closes an open menu first. With nothing open, it works normally.
@@ -220,6 +232,7 @@ class MainActivity : AppCompatActivity() {
         rotateIcons()
         placePanels()
         placeCog(animated = true)
+        updateFrameRot()
         // Open menus jump to their new angle, so fade them back in instead of letting them pop
         for (v in listOf(panel, settingsPanel)) if (v.visibility == View.VISIBLE) {
             v.alpha = 0f; v.animate().alpha(1f).setDuration(200).start()
@@ -256,7 +269,7 @@ class MainActivity : AppCompatActivity() {
             preserveEGLContextOnPause = true
         }
         renderer = SketchRenderer(glView)
-        renderer.settings = settings.copy()
+        renderer.settings = settings.snapshot()
         renderer.onNeedCamera = { startCamera() }
         renderer.onNeedVideo = { reopenVideo() }
         renderer.onRecordError = { msg -> toast(msg); stopRecording(failed = true) }
@@ -265,7 +278,7 @@ class MainActivity : AppCompatActivity() {
         videoBox.addView(glView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
         tabsCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        for (name in listOf("Style", "Lines", "Shade", "Paper", "Motion")) {
+        for (name in listOf("Style", "Finish", "Lines", "Shade", "Paper", "Motion")) {
             val t = GlossTab(this, name).apply { setOnClickListener { toggleTab(name) }; contentDescription = "$name settings" }
             tabs[name] = t
             tabsCol.addView(t, LinearLayout.LayoutParams(dp(58), dp(58)).apply { topMargin = dp(5); bottomMargin = dp(5) })
@@ -287,6 +300,20 @@ class MainActivity : AppCompatActivity() {
         panel.addView(panelContent)
         panelHost.addView(panel, FrameLayout.LayoutParams(dp(290), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
         panel.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> hugTabs() }   // stay snug to the tabs when its size changes
+
+        // The look label: a small black glass pill that fades in over the
+        // picture for 2 seconds whenever the look changes, like
+        // "Watercolor + Vignette + Polaroid". It sits toward YOUR top edge
+        // and turns to face you (see placeLookLabel).
+        lookLabel = TextView(this).apply {
+            setTextColor(Gloss.SILVER_HI); textSize = 14f; gravity = Gravity.CENTER
+            paint.isFakeBoldText = true; shade()
+            setPadding(dp(16), dp(8), dp(16), dp(9))
+            background = GlossPanelDrawable(dp(16).toFloat()).apply { opacity = 0.8f }
+            alpha = 0f; visibility = View.GONE
+        }
+        videoBox.addView(lookLabel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
 
         // --- Control deck (dial, flip button, mode label)
         deck = FrameLayout(this)
@@ -435,6 +462,55 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
+    /**
+     * Show the look label ("Oil painting + Matte") for 2 seconds: fade in,
+     * hold, fade out. Called whenever the look or the finishes change.
+     */
+    private fun showLookLabel() {
+        lookLabel.text = settings.summary()
+        placeLookLabel()
+        lookLabel.animate().cancel()
+        handler.removeCallbacks(hideLookLabel)
+        lookLabel.visibility = View.VISIBLE
+        lookLabel.animate().alpha(1f).setDuration(200).start()
+        handler.postDelayed(hideLookLabel, 2200)
+    }
+    private val hideLookLabel = Runnable {
+        lookLabel.animate().alpha(0f).setDuration(400).withEndAction { lookLabel.visibility = View.GONE }.start()
+    }
+
+    /**
+     * Put the look label near the top edge as YOU see it, turned to face
+     * you. In the portrait grid, "your top" is a different side of the
+     * drawing area depending on how the phone is held.
+     */
+    private fun placeLookLabel() {
+        val w = videoBox.width.toFloat(); val h = videoBox.height.toFloat()
+        lookLabel.rotation = -deviceRot.toFloat()
+        val (tx, ty) = when (deviceRot) {
+            90 -> -w * 0.36f to 0f        // left side up: your top is the portrait left edge
+            180 -> 0f to h * 0.40f        // upside down: your top is the portrait bottom
+            270 -> w * 0.36f to 0f        // right side up: your top is the portrait right edge
+            else -> 0f to -h * 0.40f
+        }
+        lookLabel.translationX = tx; lookLabel.translationY = ty
+    }
+
+    /**
+     * Tell the renderer which edge of the picture is the viewer's bottom, so
+     * the polaroid's thick edge and the glossy shine land the right way up.
+     * In File mode the saved picture isn't turned, so it's always 0 there.
+     */
+    private fun updateFrameRot() {
+        renderer.frameRot = if (mode == ModeDial.FILE) 0 else outRotation()
+        glView.requestRender()
+    }
+
+    /** Light up the Finish tab with a count of how many finishes are on. */
+    private fun updateFinishBadge() {
+        tabs["Finish"]?.badge = settings.finishCount()
+    }
+
     /** Black glass deck with a thin silver line along the top edge. */
     private fun deckBackground(h: Int): android.graphics.drawable.Drawable {
         val sd = ShapeDrawable(RectShape())
@@ -472,6 +548,9 @@ class MainActivity : AppCompatActivity() {
         mode = m
         if (!fromDial) dial.setMode(m)
         renderer.animate = m != ModeDial.PHOTO                 // in Photo mode the drawing holds still
+        // Video mode draws at the recording size so what you see is what gets recorded
+        renderer.cameraShort = if (m == ModeDial.VIDEO) videoShort else 0
+        updateFrameRot()
         tabs["Motion"]?.visibility = if (m == ModeDial.PHOTO) View.GONE else View.VISIBLE
         if (m == ModeDial.PHOTO && openTab == "Motion") closePanel()
         flipBtn.visibility = if (m == ModeDial.FILE) View.INVISIBLE else View.VISIBLE
@@ -528,10 +607,14 @@ class MainActivity : AppCompatActivity() {
             // With a photo or video loaded in File mode the camera isn't needed, so turn it off to save battery
             if (mode == ModeDial.FILE && fileLoaded()) { provider.unbindAll(); return@addListener }
 
-            // Upright = 4:3, sideways = 16:9. Photo mode gets more pixels; video stays lighter so it keeps up.
+            // Upright = 4:3, sideways = 16:9. Photo mode asks for 1920 on the long
+            // side. Video mode asks for the recording size from Settings.
+            // Every camera offers a different list of sizes. If it doesn't have
+            // the one asked for, CameraX picks the closest it has (bigger first,
+            // then smaller) and the renderer scales it to the drawing size anyway.
             val ratio = if (landscapeHeld) AspectRatio.RATIO_16_9 else AspectRatio.RATIO_4_3
-            val long = if (mode == ModeDial.PHOTO) 1920 else 1280
-            val short = if (ratio == AspectRatio.RATIO_16_9) long * 9 / 16 else long * 3 / 4
+            val short = if (mode == ModeDial.VIDEO) videoShort else if (ratio == AspectRatio.RATIO_16_9) 1080 else 1440
+            val long = if (ratio == AspectRatio.RATIO_16_9) short * 16 / 9 else short * 4 / 3
             val selector = ResolutionSelector.Builder()
                 .setAspectRatioStrategy(AspectRatioStrategy(ratio, AspectRatioStrategy.FALLBACK_RULE_AUTO))
                 .setResolutionStrategy(ResolutionStrategy(Size(long, short), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
@@ -540,7 +623,16 @@ class MainActivity : AppCompatActivity() {
             val exec = ContextCompat.getMainExecutor(this)
             // CameraX asks for somewhere to send frames; the renderer hands it a Surface
             preview.setSurfaceProvider(exec) { req -> renderer.provideSurface(req, exec) }
-            val lens = if (useFront) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+            // Not every phone or tablet has both a front and a back camera. If
+            // the one asked for is missing, fall back to the other.
+            val front = CameraSelector.DEFAULT_FRONT_CAMERA; val back = CameraSelector.DEFAULT_BACK_CAMERA
+            fun has(sel: CameraSelector) = try { provider.hasCamera(sel) } catch (e: Exception) { false }
+            var lens = if (useFront) front else back
+            if (!has(lens)) {
+                val other = if (useFront) back else front
+                if (!has(other)) { toast("No camera found on this device."); return@addListener }
+                useFront = !useFront; settings.mirror = useFront; pushSettings(); lens = other
+            }
             try { provider.unbindAll(); provider.bindToLifecycle(this, lens, preview) }
             catch (e: Exception) { toast("Camera couldn't start: ${e.message}") }
         }, ContextCompat.getMainExecutor(this))
@@ -551,6 +643,7 @@ class MainActivity : AppCompatActivity() {
         useFront = !useFront
         settings.mirror = useFront              // selfies look right mirrored, like a mirror
         pushSettings()
+        updateFrameRot()
         startCamera()
     }
 
@@ -706,8 +799,10 @@ class MainActivity : AppCompatActivity() {
         if (u == null || info == null || surf == null) { toast("The video isn't ready yet."); return }
         if (openTab != null) closePanel()
         stopPlayer()                                         // the exporter takes over the decoder Surface
-        val size = SketchRenderer.videoProcSize(info.width, info.height, info.rotation)
-        val ex = VideoExporter(this, u, surf, renderer, size.width, size.height, info.durationUs,
+        // Save at the Video resolution from Settings, but never bigger than the clip itself
+        val short = min(videoShort, min(info.width, info.height))
+        val size = SketchRenderer.videoProcSize(info.width, info.height, info.rotation, short)
+        val ex = VideoExporter(this, u, surf, renderer, size.width, size.height, short, info.durationUs,
             onProgress = { pct -> if (exporting) showSaving(pct) },
             onDone = { _, msg ->
                 exporter = null
@@ -730,21 +825,83 @@ class MainActivity : AppCompatActivity() {
     // ========================================================================
     // Video mode: recording the live drawing
     // ========================================================================
+    /**
+     * Start recording. Before anything starts, two checks pick the size:
+     *
+     *  1. Can this phone's video encoder take it? Starting at the size picked
+     *     in Settings, step down (4K, 1440p, 1080p, 720p) until it can.
+     *  2. Can the GPU draw the current look that big, fast enough? Video
+     *     mode is already drawing at the recording size, and the renderer
+     *     keeps count of camera frames coming in versus frames it managed to
+     *     draw. If it's falling behind (under 85% of frames drawn), step down
+     *     to the biggest size that should keep up. Fewer pixels means
+     *     proportionally less work, so the expected speed at a smaller size
+     *     is the measured speed times the ratio of pixel counts.
+     *
+     * Either way, a short message says what size it's really recording at.
+     */
     private fun startRecording() {
         val size = renderer.procSize
         if (size.width == 0) { toast("Camera isn't ready yet."); return }
         val audio = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+        // The drawing's shape, so every candidate size keeps it
+        val aspect = max(size.width, size.height).toFloat() / min(size.width, size.height)
+        val tall = size.height >= size.width
+        fun dims(short: Int): Pair<Int, Int> {
+            val long = ((short * aspect).roundToInt() and 1.inv())
+            return if (tall) short to long else long to short
+        }
+        val ladder = videoSizes.map { it.second }.filter { it <= videoShort }.sortedDescending()
+
+        // ---- Check 1: the encoder
+        var pickShort = -1
+        var fit: EncoderCheck.Fit? = null
+        for (s in ladder) {
+            val (w, h) = dims(s)
+            val f = EncoderCheck.fit(w, h)
+            if (f != null) { pickShort = s; fit = f; break }
+        }
+        if (fit == null) { toast("This phone's video encoder can't record any of the sizes. Recording wasn't started."); return }
+        var message: String? = if (pickShort < videoShort)
+            "This phone can't record ${sizeName(videoShort)}. Recording at ${sizeName(pickShort)}." else null
+
+        // ---- Check 2: can the GPU keep up?
+        val perf = renderer.perf
+        if (perf != null && perf.arrivedFps > 10f && perf.drawnFps < perf.arrivedFps * 0.85f) {
+            val drawnPixels = perf.w.toFloat() * perf.h
+            val need = perf.arrivedFps * 0.9f
+            var slower = -1
+            var slowerFit: EncoderCheck.Fit? = null
+            for (s in ladder.filter { it < pickShort }) {
+                val (w, h) = dims(s)
+                val expected = perf.drawnFps * drawnPixels / (w.toFloat() * h)
+                val f = EncoderCheck.fit(w, h) ?: continue
+                slower = s; slowerFit = f
+                if (expected >= need) break           // biggest size that should keep up
+            }
+            if (slowerFit != null) {
+                message = "${Looks.names[settings.style]} can't hold a steady frame rate at ${sizeName(pickShort)} " +
+                    "on this phone. Recording at ${sizeName(slower)}."
+                pickShort = slower; fit = slowerFit
+            }
+        }
+        message?.let { toast(it) }
+        val f = fit!!
+        renderer.cameraShort = pickShort                 // draw at the size being recorded
+
+        // Turned = the encoder only takes wide frames, so the picture goes in
+        // sideways and the file is tagged to turn it back (a quarter turn less)
+        val hint = if (f.turned) (outRotation() + 270) % 360 else outRotation()
         val rec = VideoRecorder(this)
-        // Video encoders want even numbers for width and height
-        val w = size.width and 1.inv(); val h = size.height and 1.inv()
-        if (!rec.prepare(w, h, outRotation(), audio)) { toast("Couldn't start recording."); return }
+        if (!rec.prepare(f.w, f.h, hint, audio, EncoderCheck.bitrate(f.w, f.h))) { toast("Couldn't start recording."); return }
         try { rec.start() } catch (e: Exception) { rec.abandon(); toast("Couldn't start recording."); return }
         recorder = rec; recording = true
         dial.recording = true; dial.locked = true
         flipBtn.isEnabled = false; flipBtn.alpha = 0.4f
         recStart = SystemClock.elapsedRealtime()
         handler.post(recTimer)
-        renderer.startRecording(rec.surface!!)
+        renderer.startRecording(rec.surface!!, f.w, f.h, f.turned)
     }
 
     private fun stopRecording(failed: Boolean = false, fromPause: Boolean = false) {
@@ -753,6 +910,7 @@ class MainActivity : AppCompatActivity() {
         handler.removeCallbacks(recTimer)
         dial.recording = false; dial.locked = false
         flipBtn.isEnabled = true; flipBtn.alpha = 1f
+        if (mode == ModeDial.VIDEO) renderer.cameraShort = videoShort   // back to the Settings size
         updateModeLabel()
         if (fromPause) { renderer.stopRecording { }; rec.stop(); return }
         // Let the renderer finish its last frame before closing the file
@@ -833,6 +991,25 @@ class MainActivity : AppCompatActivity() {
         slider("Menu background", 0f, 100f, 1f, { uiOpacity * 100f }, { setMenuOpacity(it / 100f) }) { "${it.roundToInt()}%" }
         note("0% is clear glass so you can watch the drawing while you adjust. 100% is solid.")
 
+        heading("Video resolution")
+        val resGroup = RadioGroup(this)
+        videoSizes.forEachIndexed { i, (label, short) ->
+            resGroup.addView(RadioButton(this).apply {
+                id = 2000 + i; text = label; setTextColor(Gloss.TEXT); shade()
+                buttonTintList = ColorStateList.valueOf(Gloss.SILVER_1)
+                isChecked = short == videoShort
+            })
+        }
+        resGroup.setOnCheckedChangeListener { _, id ->
+            if (id < 2000) return@setOnCheckedChangeListener
+            videoShort = videoSizes[id - 2000].second
+            saveUiPrefs()
+            if (mode == ModeDial.VIDEO && !recording) { renderer.cameraShort = videoShort; startCamera() }
+        }
+        settingsContent.addView(resGroup)
+        note("For Video mode and for saving videos in File mode. If the phone can't record the size " +
+            "you pick, or can't keep up with the current look at that size, it drops to the next size down and says so.")
+
         heading("Behavior")
         check("Haptic clicks on the dial", { haptics }, { haptics = it; applyUiPrefs(); saveUiPrefs() })
         check("Keep screen awake", { keepAwake }, { keepAwake = it; applyUiPrefs(); saveUiPrefs() })
@@ -862,11 +1039,13 @@ class MainActivity : AppCompatActivity() {
         haptics = prefs.getBoolean("haptics", true)
         keepAwake = prefs.getBoolean("keepAwake", true)
         rememberLook = prefs.getBoolean("rememberLook", true)
+        videoShort = prefs.getInt("videoShort", 1080).let { v -> if (videoSizes.any { it.second == v }) v else 1080 }
     }
 
     private fun saveUiPrefs() {
         prefs.edit().putFloat("uiOpacity", uiOpacity).putBoolean("haptics", haptics)
-            .putBoolean("keepAwake", keepAwake).putBoolean("rememberLook", rememberLook).apply()
+            .putBoolean("keepAwake", keepAwake).putBoolean("rememberLook", rememberLook)
+            .putInt("videoShort", videoShort).apply()
     }
 
     /** Put the app settings into effect on the live screen. */
@@ -888,32 +1067,56 @@ class MainActivity : AppCompatActivity() {
     private lateinit var target: LinearLayout
     private lateinit var targetRefreshers: MutableList<() -> Unit>
 
-    private val styleNames = listOf("Pencil", "Ink pen", "Colored pencil", "Comic", "Halftone", "Watercolor", "Chalkboard")
-
     private fun buildGroup(name: String) {
-        panelContent.removeAllViews(); refreshers.clear()
+        panelContent.removeAllViews(); refreshers.clear(); lookBox = null
         target = panelContent; targetRefreshers = refreshers
         when (name) {
             "Style" -> {
-                heading("Drawing style")
+                heading("Look")
                 val group = RadioGroup(this)
-                styleNames.forEachIndexed { i, label ->
+                Looks.names.forEachIndexed { i, label ->
                     group.addView(RadioButton(this).apply {
                         id = 1000 + i; text = label; setTextColor(Gloss.TEXT); shade()
                         buttonTintList = ColorStateList.valueOf(Gloss.SILVER_1)
                     })
                 }
-                group.setOnCheckedChangeListener { _, id -> if (id >= 1000) { settings.style = id - 1000; pushSettings() } }
+                group.setOnCheckedChangeListener { _, id ->
+                    if (id >= 1000 && id - 1000 != settings.style) {
+                        settings.style = id - 1000
+                        pushSettings(); buildLookBox(); showLookLabel()
+                    }
+                }
                 panelContent.addView(group)
                 refreshers += { group.check(1000 + settings.style) }
-                note("Comic and Halftone use Stroke spacing (Shade tab) for their dot size.")
+
+                // The chosen look's own sliders go in here, and get swapped
+                // out whenever a different look is picked
+                lookBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                panelContent.addView(lookBox)
+                buildLookBox()
 
                 heading("Setup")
-                check("Mirror image", { settings.mirror }, { settings.mirror = it })
+                check("Mirror image", { settings.mirror }, { settings.mirror = it; updateFrameRot() })
                 button("Rotate camera 90°") { settings.rotationFix = (settings.rotationFix + 1) % 4; pushSettings() }
                 button("Reset all sliders") {
                     settings = SketchSettings(mirror = settings.mirror, rotationFix = settings.rotationFix)
-                    pushSettings(); refreshers.forEach { it() }
+                    pushSettings(); refreshers.forEach { it() }; buildLookBox()
+                    updateFinishBadge(); showLookLabel()
+                }
+            }
+            "Finish" -> {
+                heading("Finishes")
+                note("Switch on as many as you like. They sit on top of any look.")
+                Looks.finishNames.forEachIndexed { f, fname ->
+                    heading(fname)
+                    check("On", { settings.finishOn[f] }, {
+                        settings.finishOn[f] = it
+                        updateFinishBadge(); showLookLabel()
+                    })
+                    Looks.finishParams[f].forEachIndexed { i, p ->
+                        slider(p.label, p.min, p.max, p.step,
+                            { settings.finishParams[f * 2 + i] }, { settings.finishParams[f * 2 + i] = it }, p.fmt)
+                    }
                 }
             }
             "Lines" -> {
@@ -953,16 +1156,38 @@ class MainActivity : AppCompatActivity() {
             "Motion" -> {
                 heading("Hand-drawn wobble")
                 slider("Wobble amount", 0f, 1f, 0.01f, { settings.boil }, { settings.boil = it }) { pct(it) }
-                slider("Redraws per second", 4f, 30f, 1f, { settings.boilFps }, { settings.boilFps = it }) { "${it.roundToInt()}" }
+                // Down at 1 or 2 per second it becomes a slow, hand-drawn flipbook
+                slider("Redraws per second", 1f, 30f, 1f, { settings.boilFps }, { settings.boilFps = it }) { "${it.roundToInt()}" }
                 check("Hold the video between redraws", { settings.holdFrames }, { settings.holdFrames = it })
             }
         }
         refreshers.forEach { it() }
     }
 
+    /**
+     * Fill the Style tab's look box with the chosen look's own sliders.
+     * The row builders add to whatever `target` is, so point it at the box
+     * for a moment, then put it back.
+     */
+    private fun buildLookBox() {
+        val box = lookBox ?: return
+        box.removeAllViews()
+        val keepTarget = target; val keepRefreshers = targetRefreshers
+        val boxRefreshers = mutableListOf<() -> Unit>()
+        target = box; targetRefreshers = boxRefreshers
+        val params = Looks.params[settings.style]
+        if (params.isNotEmpty()) heading("${Looks.names[settings.style]} settings")
+        params.forEachIndexed { i, p ->
+            slider(p.label, p.min, p.max, p.step, { settings.lookParam(i) }, { settings.setLookParam(i, it) }, p.fmt)
+        }
+        note(Looks.hint(settings.style))
+        boxRefreshers.forEach { it() }
+        target = keepTarget; targetRefreshers = keepRefreshers
+    }
+
     /** Send the current look to the renderer, save it, and redraw. */
     private fun pushSettings() {
-        renderer.settings = settings.copy()
+        renderer.settings = settings.snapshot()
         settings.save(prefs)
         glView.requestRender()
     }

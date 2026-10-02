@@ -180,7 +180,8 @@ class VideoPlayer(private val ctx: Context, private val uri: Uri, private val su
 // ============================================================================
 /**
  * @param decodeSurface the renderer's video Surface (the player must be stopped first)
- * @param procW,procH   the size the renderer draws this clip at
+ * @param procW,procH   the size the renderer draws this clip at while saving
+ * @param short         that size's short side (the Video resolution setting, or the clip's own if smaller)
  * @param onProgress    0 to 100, called on the main thread
  * @param onDone        (saved?, message for the user), called on the main thread
  */
@@ -191,6 +192,7 @@ class VideoExporter(
     private val renderer: SketchRenderer,
     private val procW: Int,
     private val procH: Int,
+    private val short: Int,
     private val durationUs: Long,
     private val onProgress: (Int) -> Unit,
     private val onDone: (Boolean, String) -> Unit
@@ -238,10 +240,9 @@ class VideoExporter(
             enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
             val caps = enc.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).videoCapabilities
             val size = pickEncoderSize(caps, procW, procH)
-            // Sketches are full of fine lines and paper grain, which take more
-            // bits than normal video to look clean
-            val top = min(40_000_000, caps.bitrateRange.upper)
-            val bitrate = (size.width.toLong() * size.height * fps / 4).toInt().coerceIn(min(4_000_000, top), top)
+            // Bitrate scales with the size, same rule as recording (see EncoderCheck.bitrate)
+            val top = min(100_000_000, caps.bitrateRange.upper)
+            val bitrate = (size.width.toLong() * size.height * fps / 5).coerceIn(min(4_000_000, top).toLong(), top.toLong()).toInt()
             val eFmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, size.width, size.height).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
@@ -274,7 +275,7 @@ class VideoExporter(
             val frames = LinkedBlockingQueue<Long>()
             val ready = CountDownLatch(1)
             var readyOk = false
-            renderer.startExport(encSurface, size.width, size.height,
+            renderer.startExport(encSurface, size.width, size.height, short,
                 onFrame = { ns -> frames.offer(ns) },
                 onReady = { good -> readyOk = good; ready.countDown() })
             if (!ready.await(3, TimeUnit.SECONDS) || !readyOk) throw IllegalStateException("GPU couldn't connect to the encoder")

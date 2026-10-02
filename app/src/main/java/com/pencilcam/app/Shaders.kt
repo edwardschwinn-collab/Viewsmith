@@ -10,7 +10,7 @@ package com.pencilcam.app
  *                   turn it upright, mirrored if needed, into a normal texture
  *   Pass 1  BLUR H: blur the brightness sideways at two different widths
  *   Pass 2  BLUR V: finish those two blurs top to bottom
- *   Pass 3  DRAW  : build the drawing (outlines, shading, paper) on screen
+ *   Pass 3  DRAW  : build the chosen look, then lay any finishes on top
  *
  * Why two blurs: subtract a wide blur from a narrow blur and what is left
  * are the edges in the picture. That difference is where the outlines go.
@@ -20,13 +20,19 @@ package com.pencilcam.app
  * All sizes in Pass 3 are in "720 units": the drawing is laid out as if the
  * picture were 720 pixels across its short side, whatever its real size.
  * That keeps the stroke spacing and wobble looking the same on a small
- * preview and on a full size save.
+ * preview and on a 4K save.
+ *
+ * These are written in the plain GLSL ES 1.00 shader language, which every
+ * phone with OpenGL ES 3.0 runs. That keeps them working on Pixels and other
+ * phones, not just Samsungs: loops only have fixed counts, and nothing uses
+ * vendor-only extensions (except the standard camera texture extension
+ * that every Android phone has).
  * ============================================================================
  */
 object Shaders {
 
     /**
-     * Vertex shader for a plain full screen rectangle (Passes 1 to 3).
+     * Vertex shader for a plain full screen rectangle (Passes 1 and 2).
      * p runs from -1 to +1 across the screen. v_uv is the same spot in
      * texture terms, which run from 0 to 1.
      */
@@ -34,6 +40,24 @@ object Shaders {
 attribute vec2 p;
 varying vec2 v_uv;
 void main(){ v_uv = p*0.5+0.5; gl_Position = vec4(p,0.0,1.0); }
+"""
+
+    /**
+     * Vertex shader for Pass 3. Same as QUAD_VS, but it can draw the picture
+     * turned a quarter turn (u_turn = 1). That's only used when a phone's
+     * video encoder won't take a tall frame: the drawing goes in sideways
+     * and the video file is tagged to be turned back upright when played.
+     */
+    const val DRAW_VS = """
+attribute vec2 p;
+uniform float u_turn;
+varying vec2 v_uv;
+void main(){
+  vec2 c = p*0.5;
+  if (u_turn > 0.5) c = vec2(-c.y, c.x);
+  v_uv = c + 0.5;
+  gl_Position = vec4(p,0.0,1.0);
+}
 """
 
     /**
@@ -80,7 +104,7 @@ varying vec2 v_uv;
 void main(){ gl_FragColor = texture2D(u_img, vec2(v_uv.x, 1.0 - v_uv.y)); }
 """
 
-    // Use high precision math when the chip has it (the S24 does).
+    // High precision math. OpenGL ES 3.0 phones all have it in fragment shaders.
     private const val PREC = """
 #ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
@@ -91,7 +115,7 @@ precision mediump float;
 
     /**
      * Pass 1: sideways blur of brightness, done twice at once.
-     * Red channel  = blur at width u_s1 (the "Line softness" slider)
+     * Red channel   = blur at width u_s1 (the "Line softness" slider)
      * Green channel = blur at 1.6 times that width
      * Blue channel  = the plain unblurred brightness
      */
@@ -132,9 +156,11 @@ void main(){
 """
 
     /**
-     * Pass 3: the drawing itself. u_style picks the look:
-     *   0 Pencil, 1 Ink pen, 2 Colored pencil, 3 Comic,
-     *   4 Halftone, 5 Watercolor, 6 Chalkboard
+     * Pass 3: the drawing itself. u_style picks the look (see Looks.names):
+     *   0 Pencil, 1 Ink pen, 2 Colored pencil, 3 Comic, 4 Halftone,
+     *   5 Watercolor, 6 Chalkboard, 7 Oil painting, 8 Neon edges,
+     *   9 Crayon edges, 10 Old west, 11 Inverted, 12 Predator vision
+     * Then the finishes (vignette, matte, glossy, polaroid) go on top.
      *
      * Inputs:
      *   u_blur     the two blurs from Passes 1 and 2 (red = narrow, green = wide)
@@ -142,15 +168,23 @@ void main(){
      *   u_res      picture size in 720 units
      *   u_seed     changes on every wobble step, so the lines redraw a little differently
      *   u_strength outline darkness       u_thr     edge threshold (from the Detail slider)
-     *   u_hatch    amount of shading      u_spacing stroke or dot spacing
+     *   u_hatch    amount of shading      u_spacing stroke spacing
      *   u_boil     wobble amount          u_grain   paper grain
      *   u_ink      ink color
+     *   u_p        the current look's own three sliders
+     *   u_finOn    which finishes are on (x vignette, y matte, z glossy, w polaroid)
+     *   u_finA/B   each finish's first and second slider, same order
+     *   u_frameRot which edge of the picture is the viewer's bottom (0, 90, 180, 270),
+     *              so the polaroid's thick edge and the glossy shine land the right way up
      */
     const val DRAW_FS = PREC + """
 uniform sampler2D u_blur; uniform sampler2D u_src;
 uniform vec2 u_res;
 uniform float u_seed, u_strength, u_thr, u_hatch, u_spacing, u_boil, u_grain, u_style;
 uniform vec3 u_ink;
+uniform vec3 u_p;
+uniform vec4 u_finOn, u_finA, u_finB;
+uniform float u_frameRot;
 varying vec2 v_uv;
 
 // ---- Helpers ---------------------------------------------------------------
@@ -170,6 +204,22 @@ float lum(vec3 c){ return dot(c, vec3(0.299,0.587,0.114)); }
 
 // Turn a point around the origin by angle a (radians).
 vec2 rot(vec2 p, float a){ float c = cos(a), s = sin(a); return vec2(c*p.x - s*p.y, s*p.x + c*p.y); }
+
+// Hue, saturation, brightness to red, green, blue. Hue runs 0 to 1 around the color wheel.
+vec3 hsv2rgb(float h, float s, float v){
+  vec3 k = clamp(abs(fract(h + vec3(0.0, 2.0/3.0, 1.0/3.0))*6.0 - 3.0) - 1.0, 0.0, 1.0);
+  return v*mix(vec3(1.0), k, s);
+}
+
+// Heat camera colors: black, deep blue, purple, red, orange, yellow, white.
+vec3 thermal(float t){
+  vec3 c = mix(vec3(0.0), vec3(0.10,0.0,0.45), smoothstep(0.0,0.2,t));
+  c = mix(c, vec3(0.55,0.0,0.65), smoothstep(0.2,0.4,t));
+  c = mix(c, vec3(0.95,0.10,0.10), smoothstep(0.4,0.6,t));
+  c = mix(c, vec3(1.0,0.55,0.0), smoothstep(0.6,0.78,t));
+  c = mix(c, vec3(1.0,0.95,0.2), smoothstep(0.78,0.92,t));
+  return mix(c, vec3(1.0), smoothstep(0.92,1.0,t));
+}
 
 // One set of parallel pencil strokes at angle ang. Each stroke wanders a
 // little, breaks into dashes here and there, and varies in pressure, so it
@@ -222,9 +272,78 @@ vec3 toCmy(vec3 c, out float k){
   return (1.0 - c - k)/max(1.0 - k, 0.001);
 }
 
+// Oil paint (a Kuwahara filter). Look at the four squares that touch this
+// spot (up-left, up-right, down-left, down-right), each r units across,
+// and take the average color of whichever square is the most even. Flat
+// areas turn into smooth patches of paint while edges stay sharp, which is
+// what makes it read as brushwork instead of a blur. 3 x 3 samples per
+// square, spread out to 1.5 times r so each dab of paint is a decent size.
+vec3 kuwahara(vec2 p, float r){
+  vec3 m0 = vec3(0.0), m1 = vec3(0.0), m2 = vec3(0.0), m3 = vec3(0.0);
+  vec3 s0 = vec3(0.0), s1 = vec3(0.0), s2 = vec3(0.0), s3 = vec3(0.0);
+  for (int j = 0; j < 3; j++){
+    for (int i = 0; i < 3; i++){
+      vec2 o = vec2(float(i), float(j))*r*0.75;
+      vec3 c;
+      c = texture2D(u_src, (p + vec2(-o.x, -o.y))/u_res).rgb; m0 += c; s0 += c*c;
+      c = texture2D(u_src, (p + vec2( o.x, -o.y))/u_res).rgb; m1 += c; s1 += c*c;
+      c = texture2D(u_src, (p + vec2(-o.x,  o.y))/u_res).rgb; m2 += c; s2 += c*c;
+      c = texture2D(u_src, (p + vec2( o.x,  o.y))/u_res).rgb; m3 += c; s3 += c*c;
+    }
+  }
+  m0 /= 9.0; m1 /= 9.0; m2 /= 9.0; m3 /= 9.0;
+  // How uneven each square is (its variance, all three colors added up)
+  float v0 = dot(s0/9.0 - m0*m0, vec3(1.0));
+  float v1 = dot(s1/9.0 - m1*m1, vec3(1.0));
+  float v2 = dot(s2/9.0 - m2*m2, vec3(1.0));
+  float v3 = dot(s3/9.0 - m3*m3, vec3(1.0));
+  vec3 best = m0; float bv = v0;
+  if (v1 < bv){ bv = v1; best = m1; }
+  if (v2 < bv){ bv = v2; best = m2; }
+  if (v3 < bv){ bv = v3; best = m3; }
+  return best;
+}
+
+// The finishes need to know which way is up for the person looking at the
+// picture. These convert between picture coordinates and "viewer"
+// coordinates, where the viewer's bottom edge is y = 0.
+vec2 toViewer(vec2 uv){
+  if (u_frameRot < 45.0) return uv;
+  if (u_frameRot < 135.0) return vec2(uv.y, 1.0 - uv.x);
+  if (u_frameRot < 225.0) return 1.0 - uv;
+  return vec2(1.0 - uv.y, uv.x);
+}
+vec2 fromViewer(vec2 q){
+  if (u_frameRot < 45.0) return q;
+  if (u_frameRot < 135.0) return vec2(1.0 - q.y, q.x);
+  if (u_frameRot < 225.0) return 1.0 - q;
+  return vec2(q.y, 1.0 - q.x);
+}
+
 // ---- Main ------------------------------------------------------------------
 void main(){
+  // ---- Where this spot is. Normally that's just v_uv. With the polaroid
+  // finish on, the picture shrinks inside a white border (thick at the
+  // viewer's bottom), so every spot inside the border reads from a
+  // matching spot of a slightly cropped picture. Cropped, not squashed.
   vec2 uv = v_uv;
+  vec2 q = toViewer(v_uv);                          // this spot, as the viewer sees it
+  bool sideways = u_frameRot > 45.0 && u_frameRot < 135.0 || u_frameRot > 225.0 && u_frameRot < 315.0;
+  vec2 vres = sideways ? u_res.yx : u_res;          // picture size as the viewer sees it
+  vec2 pq = q;                                      // spot within the picture area, 0 to 1
+  bool onBorder = false;
+  if (u_finOn.w > 0.5){
+    float side = mix(14.0, 46.0, u_finA.w);         // border width in 720 units
+    vec2 lo = vec2(side, side*3.2)/vres;            // left and bottom border
+    vec2 hi = vec2(1.0) - vec2(side)/vres;          // right and top border
+    pq = (q - lo)/(hi - lo);
+    onBorder = pq.x < 0.0 || pq.x > 1.0 || pq.y < 0.0 || pq.y > 1.0;
+    vec2 inner = (hi - lo)*vres;                    // picture area in 720 units
+    float kk = max(inner.x/vres.x, inner.y/vres.y);
+    vec2 crop = inner/(kk*vres);                    // how much of the full picture fits
+    uv = fromViewer(0.5 + (clamp(pq, 0.0, 1.0) - 0.5)*crop);
+  }
+
   vec3 src = texture2D(u_src, uv).rgb;
   vec2 px = uv*u_res;                               // this spot, in 720 units
   float s = u_seed;
@@ -235,9 +354,12 @@ void main(){
                 vnoise(px/45.0 + vec2(s*5.3+31.0, s*11.9))) - 0.5;
   vec3 b = texture2D(u_blur, uv + d*u_boil*6.0/u_res).rgb;
 
-  // Outlines: narrow blur minus wide blur. Strongly negative = a dark edge.
+  // Outlines: narrow blur minus wide blur. Strongly negative = the dark side
+  // of an edge (where pencil lines go). edgeAbs catches both sides, for the
+  // looks that draw glowing or bright edges.
   float diff = b.r - b.g;
   float edge = smoothstep(u_thr, u_thr*2.5 + 0.004, -diff) * u_strength;
+  float edgeAbs = smoothstep(u_thr, u_thr*2.5 + 0.004, abs(diff)) * u_strength;
 
   // Tone: how bright this spot is, with a little extra contrast.
   float tone = clamp((b.r - 0.5)*1.15 + 0.5, 0.0, 1.0);
@@ -264,48 +386,56 @@ void main(){
     col = mix(paper, inkc, clamp(dark, 0.0, 1.0));
   }
   else if (u_style < 3.5){
-    // ---- 3 Comic: flat bold colors, heavy black outlines, dots in the shadows ----
+    // ---- 3 Comic: flat bold colors, heavy outlines, dots in the shadows ----
+    // u_p: color levels, shadow dots, outline weight
+    float lv = max(u_p.x - 1.0, 1.0);
     vec3 c = mix(vec3(lum(src)), src, 1.4);         // punch up the color
-    c = clamp(floor(c*3.0 + 0.5)/3.0, 0.0, 1.0);    // snap each channel to 4 levels
+    c = clamp(floor(c*lv + 0.5)/lv, 0.0, 1.0);      // snap each channel to a few levels
     c = mix(c, vec3(1.0), 0.06);                    // lift it a touch so it isn't muddy
     float shadow = 1.0 - smoothstep(0.18, 0.45, tone);
-    float dots = dotAt(hpx, 0.785, sp*1.2, shadow*0.6) * u_hatch;
+    float dots = dotAt(hpx, 0.785, sp*1.2, shadow*0.6) * u_p.y;
     c = mix(c, c*0.35, dots);
     c *= 1.0 - u_grain*0.04*tooth;
-    float line = smoothstep(0.12, 0.45, edge*1.6);
+    float line = smoothstep(0.12, 0.45, edge*(0.6 + 1.7*u_p.z));
     col = mix(c, u_ink*0.35, line);
   }
   else if (u_style < 4.5){
-    // ---- 4 Halftone: four ink dot screens like a printed newspaper photo ----
-    // Each ink sits on its own angle (cyan 15, magenta 75, yellow 0, black 45
-    // degrees), the same angles printers use so the dots don't clash.
-    float cell = sp*1.4;
-    float k;
+    // ---- 4 Halftone: ink dot screens like a printed newspaper photo ----
+    // u_p: dot size, color (0 = black ink only, 1 = full color), outlines.
+    // Each ink sits on its own angle (cyan 15, magenta 75, yellow 0, black
+    // 45 degrees), the same angles printers use so the dots don't clash.
+    float cell = u_p.x;
+    float k; float kk;
     vec2 hp = px + d*u_boil*3.0;
     float aC = 0.2618, aM = 1.309, aY = 0.0, aK = 0.785;
-    vec3 cmy; float kk;
+    vec3 cmy;
     cmy = toCmy(texture2D(u_src, cellCenter(hp, aC, cell)/u_res).rgb, k);
     float C = dotAt(hp, aC, cell, cmy.x);
     cmy = toCmy(texture2D(u_src, cellCenter(hp, aM, cell)/u_res).rgb, k);
     float M = dotAt(hp, aM, cell, cmy.y);
     cmy = toCmy(texture2D(u_src, cellCenter(hp, aY, cell)/u_res).rgb, k);
     float Y = dotAt(hp, aY, cell, cmy.z);
-    toCmy(texture2D(u_src, cellCenter(hp, aK, cell)/u_res).rgb, kk);
+    vec3 kc = texture2D(u_src, cellCenter(hp, aK, cell)/u_res).rgb;
+    toCmy(kc, kk);
     float K = dotAt(hp, aK, cell, kk);
     // Inks print on top of each other, so each one multiplies the paper down.
-    col = paper;
-    col *= mix(vec3(1.0), vec3(0.00, 0.63, 0.89), C);
-    col *= mix(vec3(1.0), vec3(0.90, 0.10, 0.52), M);
-    col *= mix(vec3(1.0), vec3(1.00, 0.92, 0.00), Y);
-    col *= mix(vec3(1.0), u_ink*0.5, K);
-    col = mix(col, u_ink*0.5, edge*0.8);
+    vec3 full = paper;
+    full *= mix(vec3(1.0), vec3(0.00, 0.63, 0.89), C);
+    full *= mix(vec3(1.0), vec3(0.90, 0.10, 0.52), M);
+    full *= mix(vec3(1.0), vec3(1.00, 0.92, 0.00), Y);
+    full *= mix(vec3(1.0), u_ink*0.5, K);
+    // Black only: one screen, dot size from brightness
+    vec3 mono = paper*mix(vec3(1.0), u_ink*0.5, dotAt(hp, aK, cell, 1.0 - lum(kc)));
+    col = mix(mono, full, u_p.y);
+    col = mix(col, u_ink*0.5, edge*u_p.z);
   }
   else if (u_style < 5.5){
     // ---- 5 Watercolor: soft washes that bleed past the edges ----
+    // u_p: bleed, color strength, edge pooling.
     // Read the picture at spots pushed around by slow noise so the color
     // runs a little outside the lines, then average a ring of 8 samples to
     // soften it like wet paint.
-    vec2 bleed = (vec2(vnoise(px/28.0 + s*0.7), vnoise(px/28.0 + vec2(19.0, 7.0) + s*0.7)) - 0.5)*16.0*(0.4 + u_boil);
+    vec2 bleed = (vec2(vnoise(px/28.0 + s*0.7), vnoise(px/28.0 + vec2(19.0, 7.0) + s*0.7)) - 0.5)*16.0*(0.1 + 1.2*u_p.x + 0.4*u_boil);
     vec2 wp = px + bleed;
     vec3 w = texture2D(u_src, wp/u_res).rgb;
     for (int i = 0; i < 8; i++){
@@ -315,25 +445,163 @@ void main(){
     w /= 9.0;
     w = mix(w, floor(w*5.0 + 0.5)/5.0, 0.45);       // layered washes: soft steps in color
     w = mix(vec3(lum(w)), w, 1.2);                  // a little more color
-    w = mix(vec3(1.0), w, 0.85);                    // see-through paint, the paper shows
+    w = mix(vec3(1.0), w, 0.4 + 0.6*u_p.y);         // see-through paint, the paper shows
     float pool = smoothstep(0.004, 0.03, abs(diff));// paint pools darker where a wash ends
-    w *= 1.0 - 0.18*pool;
+    w *= 1.0 - 0.36*u_p.z*pool;
     w *= 1.0 - u_grain*0.10*(1.0 - tooth);          // pigment settles into the paper grain
     col = paper*w;
     col = mix(col, u_ink, edge*0.35);               // light pencil underdrawing
   }
-  else {
+  else if (u_style < 6.5){
     // ---- 6 Chalkboard: white chalk on a slate green board ----
+    // u_p: chalk shading, board darkness, chalk dust.
     // Same strokes as pencil, but chalk adds light instead of dark, so the
     // shading goes on the BRIGHT parts of the picture.
-    vec3 board = vec3(0.13, 0.17, 0.15) + u_grain*(0.03*tooth - 0.015);
-    float h = hatching(hpx, 1.0 - tone, ja, sp, s) * u_hatch;
+    vec3 board = mix(vec3(0.20, 0.25, 0.22), vec3(0.07, 0.09, 0.08), u_p.y) + u_grain*(0.03*tooth - 0.015);
+    board += u_p.z*0.07*vnoise(px/60.0 + 5.0);       // old erased chalk haze
+    float h = hatching(hpx, 1.0 - tone, ja, sp*1.3, s) * u_p.x * 0.6;   // chalk is sparser than pencil
     float chalk = 1.0 - (1.0 - edge)*(1.0 - h*0.85);
     chalk *= mix(1.0, 0.35 + 0.65*tooth*1.3, u_grain);// chalk skips over the board's grain
     col = mix(board, vec3(0.93, 0.93, 0.88), clamp(chalk, 0.0, 1.0));
   }
+  else if (u_style < 7.5){
+    // ---- 7 Oil painting ----
+    // u_p: brush size, color richness, canvas texture
+    vec3 oc = kuwahara(px + d*u_boil*3.0, u_p.x);
+    oc = mix(vec3(lum(oc)), oc, 1.0 + 0.6*u_p.y);   // richer color
+    oc = (oc - 0.5)*(1.0 + 0.15*u_p.y) + 0.5;
+    // Canvas weave plus brush hair streaks running at a slant
+    float weave = sin(px.x*1.9)*sin(px.y*1.9)*0.5 + 0.5;
+    vec2 bp = rot(px, 0.6)*vec2(0.08, 0.9);
+    float streak = vnoise(bp);
+    oc *= 1.0 - u_p.z*(0.10*weave + 0.12*streak);
+    // Thick paint ridges catch the light from above: brighter where the
+    // streak rises toward the top, darker where it falls away
+    float ridge = vnoise(bp + vec2(0.0, 0.06)) - streak;
+    oc += u_p.z*0.8*ridge;
+    col = oc;
+  }
+  else if (u_style < 8.5){
+    // ---- 8 Neon edges: glowing tubes of light on black ----
+    // u_p: glow, hue, rainbow. The glow is the edge signal sampled in a
+    // ring around this spot, so light spills out from every line.
+    float g = 0.0;
+    float R = 3.0 + 9.0*u_p.x;
+    for (int i = 0; i < 8; i++){
+      float a = float(i)*0.785 + s*0.3;
+      vec3 bb = texture2D(u_blur, uv + vec2(cos(a), sin(a))*R/u_res).rgb;
+      g += smoothstep(u_thr, u_thr*2.5 + 0.004, abs(bb.r - bb.g));
+    }
+    g = g/8.0*u_strength;
+    float hue = u_p.y + u_p.z*(0.35*uv.x + 0.25*uv.y + 0.15*vnoise(px/160.0 + s*0.05));
+    vec3 nc = hsv2rgb(fract(hue), 0.85, 1.0);
+    col = vec3(0.015, 0.015, 0.03) + nc*g*(0.6 + 1.8*u_p.x) + mix(nc, vec3(1.0), 0.55)*edgeAbs*1.4;
+  }
+  else if (u_style < 9.5){
+    // ---- 9 Crayon edges: thick waxy outlines and loose colored scribbles ----
+    // u_p: stroke thickness, color fill, wax texture.
+    // Fatten the outline by also checking a few spots to each side.
+    float t = 2.0 + 6.0*u_p.x;
+    float ed = smoothstep(u_thr*0.6, u_thr*1.8 + 0.003, abs(diff));
+    for (int i = 0; i < 4; i++){
+      float a = float(i)*1.571 + 0.4;
+      vec3 bb = texture2D(u_blur, uv + (vec2(cos(a), sin(a))*t + d*u_boil*4.0)/u_res).rgb;
+      ed = max(ed, smoothstep(u_thr*0.6, u_thr*1.8 + 0.003, abs(bb.r - bb.g)));
+    }
+    ed *= u_strength;
+    vec3 wax = mix(vec3(lum(src)), src, 1.8)*0.5;   // crayon takes the picture's color, deeper
+    wax = mix(wax, u_ink, 0.35);
+    // Wax skips over the bumps in the paper, leaving little white specks
+    float cover = 1.0 - u_p.z*0.75*smoothstep(0.35, 0.75, tooth*0.7 + 0.3*vnoise(vec2(px.x*0.2, px.y*1.5)));
+    float fill = hatchLayer(hpx, 0.6 + ja, sp*1.6, s);
+    vec3 fillCol = mix(vec3(lum(src)), src, 1.4);
+    col = paper;
+    col = mix(col, fillCol*0.9, 0.8*u_p.y*fill*cover*(1.0 - tone*0.4));
+    col = mix(col, wax, clamp(ed, 0.0, 1.0)*cover);
+  }
+  else if (u_style < 10.5){
+    // ---- 10 Old west: a sepia tintype photograph ----
+    // u_p: sepia, scratches and dust, plate wear
+    float l = mix(lum(src), b.r, 0.3);              // a little soft, like an old lens
+    l = clamp((l - 0.5)*1.35 + 0.52, 0.0, 1.0);
+    float blot = vnoise(px/140.0 + vec2(3.1, 7.7)); // uneven chemistry across the plate
+    l *= 1.0 - u_p.z*0.4*smoothstep(0.55, 0.9, blot);
+    l *= 1.0 - u_p.z*0.6*smoothstep(0.3, 0.75, length(uv - 0.5));   // darker toward the edges
+    // Scratches and dust move every wobble step, like an old film reel
+    float sx = px.x + (vnoise(vec2(px.y*0.01, s)) - 0.5)*30.0;
+    float scratch = step(0.996, hash(vec2(floor(sx/1.5), floor(s)))) * step(0.3, vnoise(vec2(sx*0.01, px.y*0.02 + s)));
+    float dust = step(0.9985, hash(floor(px/1.8) + s*7.0));
+    l = mix(l, 0.95, u_p.y*scratch*0.8);
+    l = mix(l, 0.05, u_p.y*dust);
+    vec3 darkT = vec3(0.10, 0.08, 0.06), midT = vec3(0.47, 0.38, 0.27), lightT = vec3(0.93, 0.87, 0.75);
+    vec3 tinted = l < 0.5 ? mix(darkT, midT, l*2.0) : mix(midT, lightT, (l - 0.5)*2.0);
+    col = mix(vec3(l), tinted, u_p.x);
+    col *= 1.0 - u_grain*0.06*tooth;
+  }
+  else if (u_style < 11.5){
+    // ---- 11 Inverted: a color negative ----
+    // u_p: contrast, color (0 = black and white), outlines
+    vec3 inv = 1.0 - src;
+    inv = (inv - 0.5)*(0.6 + 1.2*u_p.x) + 0.5;
+    inv = mix(vec3(lum(inv)), inv, u_p.y);
+    col = mix(clamp(inv, 0.0, 1.0), vec3(0.97), edgeAbs*u_p.z);
+  }
+  else {
+    // ---- 12 Predator vision: a fake heat camera ----
+    // u_p: edge heat, contrast, scan lines. Bright spots read hot and so
+    // do busy edges. No real temperature involved, it just looks the part.
+    float heat = (b.r - 0.5)*(0.8 + 1.8*u_p.y) + 0.5 + edgeAbs*u_p.x*0.6;
+    heat += (vnoise(px/90.0 + s*0.4) - 0.5)*0.05;   // a slight shimmer
+    col = thermal(clamp(heat, 0.0, 1.0));
+    col *= 1.0 - u_p.z*0.3*(0.5 + 0.5*sin(px.y*2.2));
+  }
 
-  gl_FragColor = vec4(col, 1.0);
+  // ---- Finishes, always in this order so they stack the same way every time:
+  // matte, glossy punch, polaroid tones, vignette, polaroid border, glossy shine.
+  if (u_finOn.y > 0.5){
+    // Matte: lift the blacks, calm the color, soften the contrast
+    col = col*(1.0 - 0.22*u_finA.y) + 0.10*u_finA.y;
+    col = mix(col, vec3(lum(col)), 0.35*u_finB.y);
+    col = mix(col, vec3(0.5), 0.12*u_finB.y);
+  }
+  if (u_finOn.z > 0.5){
+    // Glossy, part one: a print coating makes colors deeper and contrast crisper
+    col = (col - 0.5)*(1.0 + 0.3*u_finB.z) + 0.5;
+    col = mix(vec3(lum(col)), col, 1.0 + 0.35*u_finB.z);
+  }
+  if (u_finOn.w > 0.5){
+    // Polaroid tones: faded, warm, slightly washed out
+    float fd = u_finB.w;
+    col = mix(col, vec3(lum(col)), 0.25*fd);
+    col = col*vec3(1.0, 0.98, 0.90)*(1.0 - 0.12*fd) + vec3(0.07, 0.06, 0.04)*fd*1.2;
+    // The border's top edge shades the very top of the picture (light from above)
+    col *= 1.0 - 0.10*(1.0 - smoothstep(0.0, 0.03, 1.0 - pq.y));
+  }
+  if (u_finOn.x > 0.5){
+    // Vignette: darken toward the corners of the picture area
+    vec2 c = (pq - 0.5)*vec2(vres.x/vres.y, 1.0);
+    float r = length(c)/length(vec2(vres.x/vres.y, 1.0)*0.5);   // 0 at the center, 1 in the corners
+    float start = mix(0.7, 0.05, u_finB.x);
+    col *= 1.0 - u_finA.x*smoothstep(start, start + 0.55, r);
+  }
+  col = clamp(col, 0.0, 1.0);
+  if (onBorder){
+    // The polaroid's white border: a slightly textured card, a touch
+    // brighter at the top where the light hits it
+    vec2 bq = q*vres;
+    float t = vnoise(bq*0.8)*0.5 + vnoise(bq*0.25)*0.5;
+    col = (vec3(0.95, 0.94, 0.90) - 0.025*t*(0.5 + u_grain))*(0.97 + 0.04*q.y);
+  }
+  if (u_finOn.z > 0.5){
+    // Glossy, part two: the shine. A soft glow toward the top and one
+    // reflection band near the top edge, because the light is overhead.
+    float band = smoothstep(0.45, 1.0, q.y);
+    float y = (q.y - 0.82 + 0.15*(q.x - 0.5))*9.0;
+    float streak = exp(-y*y);
+    col += (1.0 - col)*u_finA.z*(0.14*band + 0.40*streak);
+  }
+
+  gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
 }
 """
 }

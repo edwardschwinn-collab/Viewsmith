@@ -5,12 +5,13 @@ Read this first every session. It carries everything from the earlier chats.
 ## What this is
 ViewSmith is a personal Android camera app (a successor to the old "Paper Camera" app).
 It redraws the live camera feed, a gallery video, or a gallery photo as a hand-drawn
-sketch in one of 7 styles, with optional hand-drawn "wobble" (line boil).
+sketch in one of 13 looks, with stackable finishes and optional hand-drawn "wobble" (line boil).
 Renamed from PencilCam in v0.4. The GitHub repo and local folder are still named PencilCam.
 Owner: Rodger. First Android app, so explain Android-specific steps plainly.
-Test phone: Samsung Galaxy S24 Ultra.
+Test phone: Samsung Galaxy S24 Ultra. Must ALSO work on Google Pixel and other phones: no Samsung-only
+APIs, check camera/encoder capabilities and fall back, shaders stay GLSL ES 1.00 (runs on any ES 3.0 GPU).
 
-## Current state: v0.4 (versionCode 4)
+## Current state: v0.5 (versionCode 5)
 - v0.1: live sketch shader on camera feed.
 - v0.2: glossy silver/black-glass UI, ModeDial shutter (drag ring: PHOTO / VIDEO / FILE),
   video recording with sound, File mode for photos, side tabs (Style, Lines, Shade, Paper,
@@ -22,12 +23,20 @@ Test phone: Samsung Galaxy S24 Ultra.
   silently on screen, tap saves a sketched copy with original audio (tap again cancels).
   New styles: Comic (3), Halftone (4), Watercolor (5), Chalkboard (6).
   Saves go to Pictures/ViewSmith and Movies/ViewSmith.
-- v0.4 has NOT been tested on the phone yet. Most likely trouble spots: video rotation
+- v0.5: looks 7-12 (Oil painting = Kuwahara, Neon edges, Crayon edges, Old west tintype,
+  Inverted, Predator vision = fake thermal palette). Every look past the first three has 3
+  own sliders (Looks.kt -> SketchSettings.lookParams -> u_p). Finish tab: vignette, matte,
+  glossy, polaroid, stackable (finishOn/finishParams -> u_finOn/u_finA/u_finB); tab badge
+  + 2 s look label. Video resolution setting 720/1080/1440/4K (default 1080), encoder
+  check + GPU keep-up check step down with a toast. Redraws per second min is 1.
+- v0.4 and v0.5 have NOT been tested on a phone yet. Most likely trouble spots: video rotation
   sign in File mode (renderer applies the clip's rotation itself in Pass 0, decoder
-  KEY_ROTATION forced to 0), and the look of the four new styles.
+  KEY_ROTATION forced to 0), the look of styles 3-12 (tuned by reasoning, never seen),
+  shader compile errors (only show at runtime in logcat), polaroid/glossy orientation
+  for mirrored selfies held sideways, and whether CameraX gives the Preview a 4K stream.
 
 ## Roadmap (agreed so far)
-- More styles.
+- More looks (append to the END of Looks.names so saved style numbers stay valid).
 - Before ever sharing or selling: replace the test signing key with a real secret key,
   and at the same time change applicationId/namespace to com.viewsmith.app (forces a
   fresh install, so do both together).
@@ -46,16 +55,27 @@ Test phone: Samsung Galaxy S24 Ultra.
   recorder surface, video export surface. Other threads only set @Volatile requests;
   onDrawFrame handles them on the GL thread. Slider values are in "720-pixel units"
   scaled by k. During export the wobble clock is the video's own timestamps.
+  Encoder outputs (recording, export) draw at the encoder's own size, not the proc size.
 - VideoFile.kt: VideoInfo (size/rotation/duration), VideoPlayer (real-time looping
   decode into the renderer's Surface), VideoExporter (lock-step decode -> renderer ->
   H.264 encoder -> MediaMuxer, audio copied as compressed samples).
-- Shaders.kt: GLSL. DRAW_FS branches on u_style (0..6).
+- Looks.kt: catalog of looks (names, per-look slider specs, hints) and finishes. Order =
+  style number = shader u_style; only ever append.
+- Shaders.kt: GLSL ES 1.00. DRAW_VS has u_turn (quarter turn for wide-only encoders).
+  DRAW_FS branches on u_style (0..12), then applies finishes in a fixed order. u_frameRot
+  (viewer's bottom edge = outRotation(), 0 in File mode) orients the polaroid border
+  and glossy shine; polaroid crops the picture into the inner rect.
 - SketchSettings.kt: every slider value, saved to SharedPreferences "pencilcam"
-  (old name kept on purpose so saved looks survive the rename). STYLE_COUNT = 7.
+  (old name kept on purpose so saved looks survive the rename). Arrays are saved as
+  look_N, finOn_N, finVal_N. Always hand the renderer settings.snapshot() (deep copy).
 - ModeDial.kt: the silver dial shutter (drag ring, tap center, long-press in File mode).
 - Gloss.kt: the look. Gloss colors, GlossPanelDrawable (has .opacity),
   MaxHeightScrollView, GlossTab, GlossButton (FLIP or COG icon, iconRotation).
 - VideoRecorder.kt + RecordableConfigChooser.kt: MediaRecorder recording from a Surface.
+  EncoderCheck (in VideoRecorder.kt): MediaCodecList AVC caps, fit() tries upright then
+  sideways (turned), bitrate() = 0.2 bits/pixel/frame capped by the encoder.
+- Video mode draws at renderer.cameraShort (= Settings size) so the preview shows real
+  performance; renderer.perf compares camera frames arrived vs drawn over 1.5 s.
 - Icon: res/mipmap-anydpi-v26 adaptive icon. Foreground PNGs are rendered from
   design/viewsmith-icon-foreground.svg (no Inkscape/ImageMagick here; headless Edge
   screenshots with --default-background-color=00000000 work). Background is a gradient
